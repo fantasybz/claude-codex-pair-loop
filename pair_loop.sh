@@ -18,6 +18,7 @@
 #   --session-name NAME     Group logs and state artifacts under a session-specific log directory
 #   --validation-command CMD
 #                          Validation command to run after each iteration
+#   --turn-timeout SECONDS  Kill a Claude/Codex turn after this many seconds (default: 0 = disabled)
 #   --state-max-ledger-entries N
 #                          Number of recent iterations to keep expanded in .loop_state.md
 #   --until-tests-pass      Stop when validation succeeds
@@ -36,6 +37,7 @@
 #   --keep-logs             Preserve existing logs on startup
 #   --keep-workspace        Preserve existing workspace on startup
 #   --non-destructive       Alias for --keep-logs --keep-workspace
+#   --healthcheck-only      Run startup checks and exit without preparing a workspace
 #   -h, --help              Show this help message
 
 set -euo pipefail
@@ -64,6 +66,7 @@ ROLE_PRESET="balanced"
 SESSION_NAME=""
 VALIDATION_COMMAND=""
 VALIDATION_COMMAND_USED=""
+TURN_TIMEOUT="0"
 STATE_MAX_LEDGER_ENTRIES="12"
 UNTIL_TESTS_PASS=0
 UNTIL_CHECKLIST_COMPLETE=0
@@ -111,6 +114,17 @@ STARTUP_CODEX_AVAILABLE=0
 STARTUP_CODEX_REASON=""
 STARTUP_MCP_AVAILABLE=0
 STARTUP_MCP_REASON=""
+HEALTHCHECK_ONLY=0
+RUN_SUMMARY_FILE=""
+FINAL_STOP_REASON="not started"
+CLAUDE_TURN_STATUS="not-run"
+CLAUDE_TURN_REASON=""
+CODEX_TURN_STATUS="not-run"
+CODEX_TURN_REASON=""
+CLAUDE_LOG=""
+CODEX_LOG=""
+CLAUDE_HANDOFF=""
+CODEX_HANDOFF=""
 
 # Colors
 RED='\033[0;31m'
@@ -224,6 +238,15 @@ ensure_workspace_git_excludes() {
   append_unique_line "$exclude_file" ".loop_state.json"
 }
 
+ensure_workspace_git_identity() {
+  if ! git -C "$WORKSPACE" config user.name >/dev/null 2>&1; then
+    git -C "$WORKSPACE" config user.name "pair-loop"
+  fi
+  if ! git -C "$WORKSPACE" config user.email >/dev/null 2>&1; then
+    git -C "$WORKSPACE" config user.email "pair-loop@local"
+  fi
+}
+
 prepare_session_layout() {
   local session_slug meta_file
 
@@ -237,6 +260,7 @@ prepare_session_layout() {
 
   SESSION_STATE_DIR="$ACTIVE_LOG_DIR/state"
   ITERATION_HISTORY_FILE="$SESSION_STATE_DIR/iteration_history.jsonl"
+  RUN_SUMMARY_FILE="$ACTIVE_LOG_DIR/run_summary.json"
   mkdir -p "$ACTIVE_LOG_DIR" "$SESSION_STATE_DIR"
 
   meta_file="$SESSION_STATE_DIR/session_meta.env"
@@ -333,6 +357,10 @@ join_lines_with_comma() {
 
 json_escape_inline() {
   printf '%s' "$1" | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_array_from_lines() {
+  printf '%s\n' "$1" | sed '/^$/d;/^none$/d;s/\\/\\\\/g;s/"/\\"/g;s/.*/"&"/' | paste -sd, -
 }
 
 changed_files_list() {
@@ -552,6 +580,7 @@ maybe_checkpoint_iteration() {
   fi
 
   if [ "$CHECKPOINT_COMMITS" -eq 1 ]; then
+    ensure_workspace_git_identity
     git -C "$WORKSPACE" add -A >/dev/null 2>&1 || true
     commit_message="pair-loop: ${SESSION_NAME:-default} iteration ${ITERATION}"
     if commit_output="$(git -C "$WORKSPACE" commit -m "$commit_message" 2>&1)"; then
@@ -616,7 +645,7 @@ append_iteration_record() {
       "effort": "$(display_value "$CLAUDE_EFFORT" "default")",
       "durationSeconds": $CLAUDE_DURATION_SECONDS,
       "exitStatus": $CLAUDE_EXIT_STATUS,
-      "changedFiles": [$(printf '%s\n' "$CLAUDE_CHANGED_FILES" | sed '/^$/d;s/"/\\"/g;s/.*/"&"/' | paste -sd, -)]
+      "changedFiles": [$(json_array_from_lines "$CLAUDE_CHANGED_FILES")]
     },
     {
       "name": "Codex",
@@ -626,7 +655,7 @@ append_iteration_record() {
       "effort": "$(display_value "$CODEX_EFFORT" "default")",
       "durationSeconds": $CODEX_DURATION_SECONDS,
       "exitStatus": $CODEX_EXIT_STATUS,
-      "changedFiles": [$(printf '%s\n' "$CODEX_CHANGED_FILES" | sed '/^$/d;s/"/\\"/g;s/.*/"&"/' | paste -sd, -)]
+      "changedFiles": [$(json_array_from_lines "$CODEX_CHANGED_FILES")]
     }
   ],
   "nextHandoff": "$(json_escape_inline "$NEXT_HANDOFF_CONTENT")"
@@ -636,6 +665,191 @@ EOF
   cat "$temp_json" >> "$ITERATION_HISTORY_FILE"
   printf '\n' >> "$ITERATION_HISTORY_FILE"
   rm -f "$temp_json"
+}
+
+write_run_summary() {
+  local run_finished_at
+  [ -n "$RUN_SUMMARY_FILE" ] || return 0
+  run_finished_at="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  TASK="$TASK" \
+  SESSION_NAME="$SESSION_NAME" \
+  MODE="$MODE" \
+  RUN_STARTED_AT="$RUN_STARTED_AT" \
+  RUN_FINISHED_AT="$run_finished_at" \
+  WORKSPACE="$WORKSPACE" \
+  ACTIVE_LOG_DIR="$ACTIVE_LOG_DIR" \
+  STATE_FILE="$STATE_FILE" \
+  STATE_JSON_FILE="$STATE_JSON_FILE" \
+  ITERATION_HISTORY_FILE="$ITERATION_HISTORY_FILE" \
+  RUN_SUMMARY_FILE="$RUN_SUMMARY_FILE" \
+  ITERATION="$ITERATION" \
+  MAX_ITERATIONS="$MAX_ITERATIONS" \
+  FIRST_AGENT="$FIRST_AGENT" \
+  PROFILE="$PROFILE" \
+  CLAUDE_MODEL="$CLAUDE_MODEL" \
+  CLAUDE_EFFORT="$CLAUDE_EFFORT" \
+  CODEX_MODEL="$CODEX_MODEL" \
+  CODEX_EFFORT="$CODEX_EFFORT" \
+  TURN_TIMEOUT="$TURN_TIMEOUT" \
+  ROLE_PRESET="$ROLE_PRESET" \
+  VALIDATION_COMMAND="$VALIDATION_COMMAND" \
+  VALIDATION_COMMAND_USED="$VALIDATION_COMMAND_USED" \
+  STATE_MAX_LEDGER_ENTRIES="$STATE_MAX_LEDGER_ENTRIES" \
+  RESUME="$RESUME" \
+  KEEP_WORKSPACE="$KEEP_WORKSPACE" \
+  KEEP_LOGS="$KEEP_LOGS" \
+  STARTUP_NODE_AVAILABLE="$STARTUP_NODE_AVAILABLE" \
+  STARTUP_NODE_REASON="$STARTUP_NODE_REASON" \
+  STARTUP_CLAUDE_AVAILABLE="$STARTUP_CLAUDE_AVAILABLE" \
+  STARTUP_CLAUDE_REASON="$STARTUP_CLAUDE_REASON" \
+  STARTUP_CODEX_AVAILABLE="$STARTUP_CODEX_AVAILABLE" \
+  STARTUP_CODEX_REASON="$STARTUP_CODEX_REASON" \
+  STARTUP_MCP_AVAILABLE="$STARTUP_MCP_AVAILABLE" \
+  STARTUP_MCP_REASON="$STARTUP_MCP_REASON" \
+  CURRENT_PHASE="$CURRENT_PHASE" \
+  CURRENT_HEALTH="$CURRENT_HEALTH" \
+  CURRENT_BLOCKER="$CURRENT_BLOCKER" \
+  CURRENT_OWNER="$CURRENT_OWNER" \
+  CURRENT_VALIDATION_STATUS="$CURRENT_VALIDATION_STATUS" \
+  CURRENT_VALIDATION_REASON="$CURRENT_VALIDATION_REASON" \
+  VALIDATION_LOG="$VALIDATION_LOG" \
+  LAST_CHECKPOINT_STATUS="$LAST_CHECKPOINT_STATUS" \
+  LAST_CHECKPOINT_REASON="$LAST_CHECKPOINT_REASON" \
+  LAST_CHECKPOINT_REF="$LAST_CHECKPOINT_REF" \
+  STOP_CHECKS_SUMMARY="$STOP_CHECKS_SUMMARY" \
+  UNTIL_TESTS_PASS="$UNTIL_TESTS_PASS" \
+  UNTIL_CHECKLIST_COMPLETE="$UNTIL_CHECKLIST_COMPLETE" \
+  UNTIL_CLEAN_GIT="$UNTIL_CLEAN_GIT" \
+  CLAUDE_TURN_STATUS="$CLAUDE_TURN_STATUS" \
+  CLAUDE_TURN_REASON="$CLAUDE_TURN_REASON" \
+  CLAUDE_DURATION_SECONDS="$CLAUDE_DURATION_SECONDS" \
+  CLAUDE_EXIT_STATUS="$CLAUDE_EXIT_STATUS" \
+  CLAUDE_CHANGED_FILES="$CLAUDE_CHANGED_FILES" \
+  CODEX_TURN_STATUS="$CODEX_TURN_STATUS" \
+  CODEX_TURN_REASON="$CODEX_TURN_REASON" \
+  CODEX_DURATION_SECONDS="$CODEX_DURATION_SECONDS" \
+  CODEX_EXIT_STATUS="$CODEX_EXIT_STATUS" \
+  CODEX_CHANGED_FILES="$CODEX_CHANGED_FILES" \
+  FINAL_STOP_REASON="$FINAL_STOP_REASON" \
+    node <<'EOF'
+const fs = require("fs");
+
+const env = process.env;
+const bool = (value) => value === "1";
+const num = (value) => Number.parseInt(value || "0", 10);
+const list = (value) => (value || "")
+  .split("\n")
+  .map((item) => item.trim())
+  .filter((item) => item.length > 0 && item !== "none");
+
+const iterationsCompleted = num(env.ITERATION);
+const lastIteration = iterationsCompleted > 0 ? {
+  iteration: iterationsCompleted,
+  agents: [
+    {
+      name: "Claude Code",
+      status: env.CLAUDE_TURN_STATUS,
+      reason: env.CLAUDE_TURN_REASON,
+      model: env.CLAUDE_MODEL || "default",
+      effort: env.CLAUDE_EFFORT || "default",
+      durationSeconds: num(env.CLAUDE_DURATION_SECONDS),
+      exitStatus: num(env.CLAUDE_EXIT_STATUS),
+      changedFiles: list(env.CLAUDE_CHANGED_FILES),
+    },
+    {
+      name: "Codex",
+      status: env.CODEX_TURN_STATUS,
+      reason: env.CODEX_TURN_REASON,
+      model: env.CODEX_MODEL || "default",
+      effort: env.CODEX_EFFORT || "default",
+      durationSeconds: num(env.CODEX_DURATION_SECONDS),
+      exitStatus: num(env.CODEX_EXIT_STATUS),
+      changedFiles: list(env.CODEX_CHANGED_FILES),
+    },
+  ],
+  validation: {
+    status: env.CURRENT_VALIDATION_STATUS,
+    reason: env.CURRENT_VALIDATION_REASON,
+    command: env.VALIDATION_COMMAND_USED || "",
+    log: env.VALIDATION_LOG || "",
+  },
+  checkpoint: {
+    status: env.LAST_CHECKPOINT_STATUS,
+    reason: env.LAST_CHECKPOINT_REASON,
+    ref: env.LAST_CHECKPOINT_REF,
+  },
+} : null;
+
+const summary = {
+  task: env.TASK,
+  session: {
+    name: env.SESSION_NAME || "default",
+    mode: env.MODE,
+    runStartedAt: env.RUN_STARTED_AT,
+    runFinishedAt: env.RUN_FINISHED_AT,
+    workspace: env.WORKSPACE,
+    logDir: env.ACTIVE_LOG_DIR,
+    firstAgent: env.FIRST_AGENT,
+  },
+  config: {
+    maxIterations: num(env.MAX_ITERATIONS),
+    profile: env.PROFILE || "custom",
+    claudeModel: env.CLAUDE_MODEL || "default",
+    claudeEffort: env.CLAUDE_EFFORT || "default",
+    codexModel: env.CODEX_MODEL || "default",
+    codexEffort: env.CODEX_EFFORT || "default",
+    turnTimeoutSeconds: num(env.TURN_TIMEOUT),
+    rolePreset: env.ROLE_PRESET,
+    validationCommand: env.VALIDATION_COMMAND || "",
+    validationCommandUsed: env.VALIDATION_COMMAND_USED || "",
+    stateMaxLedgerEntries: num(env.STATE_MAX_LEDGER_ENTRIES),
+    resume: bool(env.RESUME),
+    keepWorkspace: bool(env.KEEP_WORKSPACE),
+    keepLogs: bool(env.KEEP_LOGS),
+  },
+  iterationsCompleted,
+  finalStatus: {
+    phase: env.CURRENT_PHASE,
+    health: env.CURRENT_HEALTH,
+    blocker: env.CURRENT_BLOCKER,
+    owner: env.CURRENT_OWNER,
+    stopReason: env.FINAL_STOP_REASON,
+  },
+  validation: {
+    status: env.CURRENT_VALIDATION_STATUS,
+    reason: env.CURRENT_VALIDATION_REASON,
+    command: env.VALIDATION_COMMAND_USED || "",
+    log: env.VALIDATION_LOG || "",
+  },
+  checkpoint: {
+    status: env.LAST_CHECKPOINT_STATUS,
+    reason: env.LAST_CHECKPOINT_REASON,
+    ref: env.LAST_CHECKPOINT_REF,
+  },
+  stopConditions: {
+    untilTestsPassConfigured: bool(env.UNTIL_TESTS_PASS),
+    untilChecklistCompleteConfigured: bool(env.UNTIL_CHECKLIST_COMPLETE),
+    untilCleanGitConfigured: bool(env.UNTIL_CLEAN_GIT),
+    summary: env.STOP_CHECKS_SUMMARY,
+  },
+  healthChecks: {
+    node: { available: bool(env.STARTUP_NODE_AVAILABLE), reason: env.STARTUP_NODE_REASON },
+    claude: { available: bool(env.STARTUP_CLAUDE_AVAILABLE), reason: env.STARTUP_CLAUDE_REASON },
+    codex: { available: bool(env.STARTUP_CODEX_AVAILABLE), reason: env.STARTUP_CODEX_REASON },
+    mcp: { available: bool(env.STARTUP_MCP_AVAILABLE), reason: env.STARTUP_MCP_REASON },
+  },
+  artifacts: {
+    stateFile: env.STATE_FILE,
+    stateJsonFile: env.STATE_JSON_FILE,
+    iterationHistoryFile: env.ITERATION_HISTORY_FILE,
+    runSummaryFile: env.RUN_SUMMARY_FILE,
+  },
+  lastIteration,
+};
+
+fs.writeFileSync(env.RUN_SUMMARY_FILE, `${JSON.stringify(summary, null, 2)}\n`);
+EOF
 }
 
 clean_directory_contents() {
@@ -651,14 +865,26 @@ run_with_timeout() {
   local output_file pid elapsed status
   output_file="$(mktemp)"
 
-  "$@" >"$output_file" 2>&1 &
+  if [ "$timeout_seconds" -le 0 ]; then
+    "$@" >"$output_file" 2>&1
+    status=$?
+    cat "$output_file"
+    rm -f "$output_file"
+    return "$status"
+  fi
+
+  (
+    "$@" >"$output_file" 2>&1
+  ) &
   pid=$!
   elapsed=0
 
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$elapsed" -ge "$timeout_seconds" ]; then
+      kill "-$pid" 2>/dev/null || true
       kill "$pid" 2>/dev/null || true
       sleep 1
+      kill -9 "-$pid" 2>/dev/null || true
       kill -9 "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
       cat "$output_file"
@@ -1098,13 +1324,24 @@ run_claude() {
   started_at="$(date '+%Y-%m-%d %H:%M:%S')"
   start_seconds="$(date +%s)"
 
-  if (
-    cd "$WORKSPACE" &&
-    "${cmd[@]}"
-  ) > "$raw_log" 2>&1; then
-    status=0
+  if [ "$TURN_TIMEOUT" -gt 0 ]; then
+    if (
+      cd "$WORKSPACE" &&
+      run_with_timeout "$TURN_TIMEOUT" "${cmd[@]}"
+    ) > "$raw_log" 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
   else
-    status=$?
+    if (
+      cd "$WORKSPACE" &&
+      "${cmd[@]}"
+    ) > "$raw_log" 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
   fi
 
   end_seconds="$(date +%s)"
@@ -1160,10 +1397,18 @@ run_codex() {
   started_at="$(date '+%Y-%m-%d %H:%M:%S')"
   start_seconds="$(date +%s)"
 
-  if "${cmd[@]}" > "$raw_log" 2>&1; then
-    status=0
+  if [ "$TURN_TIMEOUT" -gt 0 ]; then
+    if run_with_timeout "$TURN_TIMEOUT" "${cmd[@]}" > "$raw_log" 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
   else
-    status=$?
+    if "${cmd[@]}" > "$raw_log" 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
   fi
 
   end_seconds="$(date +%s)"
@@ -1256,7 +1501,11 @@ Be constructive and build on the current state."
       CLAUDE_TURN_REASON=""
     else
       CLAUDE_TURN_STATUS="failed"
-      CLAUDE_TURN_REASON="Claude Code execution failed; inspect $CLAUDE_LOG"
+      if [ "$CLAUDE_EXIT_STATUS" -eq 124 ] && [ "$TURN_TIMEOUT" -gt 0 ]; then
+        CLAUDE_TURN_REASON="Claude Code turn timed out after ${TURN_TIMEOUT}s; inspect $CLAUDE_LOG"
+      else
+        CLAUDE_TURN_REASON="Claude Code execution failed; inspect $CLAUDE_LOG"
+      fi
       echo -e "${YELLOW}Claude Code failed during iteration $ITERATION. Continuing if Codex is available.${NC}"
       echo ""
     fi
@@ -1367,7 +1616,11 @@ Be constructive and build on the current state."
       CODEX_TURN_REASON=""
     else
       CODEX_TURN_STATUS="failed"
-      CODEX_TURN_REASON="Codex execution failed; inspect $CODEX_LOG"
+      if [ "$CODEX_EXIT_STATUS" -eq 124 ] && [ "$TURN_TIMEOUT" -gt 0 ]; then
+        CODEX_TURN_REASON="Codex turn timed out after ${TURN_TIMEOUT}s; inspect $CODEX_LOG"
+      else
+        CODEX_TURN_REASON="Codex execution failed; inspect $CODEX_LOG"
+      fi
       echo -e "${YELLOW}Codex failed during iteration $ITERATION. Continuing to the next iteration.${NC}"
       echo ""
     fi
@@ -1522,6 +1775,11 @@ parse_args() {
         VALIDATION_COMMAND="$2"
         shift 2
         ;;
+      --turn-timeout)
+        [ "$#" -ge 2 ] || die "--turn-timeout requires a value"
+        TURN_TIMEOUT="$2"
+        shift 2
+        ;;
       --state-max-ledger-entries)
         [ "$#" -ge 2 ] || die "--state-max-ledger-entries requires a value"
         STATE_MAX_LEDGER_ENTRIES="$2"
@@ -1557,6 +1815,10 @@ parse_args() {
       --non-destructive|--preserve)
         KEEP_LOGS=1
         KEEP_WORKSPACE=1
+        shift
+        ;;
+      --healthcheck-only)
+        HEALTHCHECK_ONLY=1
         shift
         ;;
       --until-tests-pass)
@@ -1646,6 +1908,12 @@ parse_args() {
       ;;
   esac
 
+  case "$TURN_TIMEOUT" in
+    ''|*[!0-9]*)
+      die "turn timeout must be a non-negative integer"
+      ;;
+  esac
+
   case "$FIRST_AGENT" in
     claude|codex)
       ;;
@@ -1666,7 +1934,13 @@ STATE_FILE="$WORKSPACE/.loop_state.md"
 STATE_JSON_FILE="$WORKSPACE/.loop_state.json"
 prepare_task
 run_startup_health_checks
+if [ "$HEALTHCHECK_ONLY" -eq 1 ]; then
+  echo -e "${GREEN}Health checks completed successfully. Exiting without preparing a workspace.${NC}"
+  exit 0
+fi
 prepare_workspace_and_logs
+FINAL_STOP_REASON="running"
+write_run_summary
 
 RUN_START_ITERATION="$(detect_last_iteration)"
 ITERATION="$RUN_START_ITERATION"
@@ -1688,6 +1962,11 @@ echo -e "${YELLOW}Codex effort:${NC} $(display_value "$CODEX_EFFORT" "default")"
 echo -e "${YELLOW}Role preset:${NC} $ROLE_PRESET"
 echo -e "${YELLOW}Session:${NC} $(display_value "$SESSION_NAME" "default")"
 echo -e "${YELLOW}Validation command:${NC} $(display_value "$VALIDATION_COMMAND" "auto")"
+if [ "$TURN_TIMEOUT" -gt 0 ]; then
+  echo -e "${YELLOW}Turn timeout:${NC} ${TURN_TIMEOUT}s"
+else
+  echo -e "${YELLOW}Turn timeout:${NC} disabled"
+fi
 echo -e "${YELLOW}First agent:${NC} $FIRST_AGENT"
 echo -e "${YELLOW}Resume mode:${NC} $RESUME"
 echo -e "${YELLOW}Keep workspace:${NC} $KEEP_WORKSPACE"
@@ -1800,6 +2079,7 @@ while [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; do
   echo ""
 
   if [ "$CURRENT_PHASE" = "complete" ]; then
+    FINAL_STOP_REASON="stop conditions satisfied"
     echo -e "${GREEN}Stop conditions satisfied after iteration $ITERATION.${NC}"
     break
   fi
@@ -1807,4 +2087,19 @@ while [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; do
   sleep 2
 done
 
+if [ "$CURRENT_PHASE" != "complete" ]; then
+  CURRENT_PHASE="stopped"
+  CURRENT_OWNER="unassigned"
+  [ "$CURRENT_HEALTH" = "green" ] || CURRENT_HEALTH="yellow"
+  if [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
+    FINAL_STOP_REASON="max iterations reached"
+    [ "$CURRENT_BLOCKER" != "none recorded" ] || CURRENT_BLOCKER="Maximum iterations reached before stop conditions were satisfied."
+  else
+    FINAL_STOP_REASON="loop exited"
+  fi
+fi
+
+render_state_files
+write_run_summary
 echo -e "${GREEN}Loop completed after $ITERATION iterations.${NC}"
+echo -e "${YELLOW}Run summary:${NC} $RUN_SUMMARY_FILE"

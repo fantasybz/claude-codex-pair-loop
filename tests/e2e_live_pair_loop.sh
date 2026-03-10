@@ -15,6 +15,7 @@ TASK="${PAIR_LOOP_E2E_TASK:-Create a file named smoke.txt at the workspace root 
 VALIDATION_COMMAND="${PAIR_LOOP_E2E_VALIDATION_COMMAND:-test \"\$(wc -l < smoke.txt)\" -eq 1 && test \"\$(wc -c < smoke.txt)\" -eq 11 && printf 'smoke test\\n' | cmp -s - smoke.txt}"
 ROLE_PRESET="${PAIR_LOOP_E2E_ROLE_PRESET:-balanced}"
 CLEANUP=0
+SUCCESS=0
 REQUIRE_CLAUDE_TURN=0
 REQUIRE_CODEX_TURN=0
 EXTRA_LOOP_ARGS=()
@@ -65,7 +66,7 @@ sanitize_name() {
 }
 
 cleanup_artifacts() {
-  if [ "$CLEANUP" -eq 1 ]; then
+  if [ "$CLEANUP" -eq 1 ] && [ "$SUCCESS" -eq 1 ]; then
     rm -rf "$WORKSPACE" "$LOG_DIR"
   fi
 }
@@ -183,6 +184,7 @@ fi
 SESSION_SLUG="$(sanitize_name "$SESSION_NAME")"
 [ -n "$SESSION_SLUG" ] || die "session name must contain at least one alphanumeric character"
 ACTIVE_LOG_DIR="$LOG_DIR/$SESSION_SLUG"
+RUN_SUMMARY_FILE="$ACTIVE_LOG_DIR/run_summary.json"
 
 mkdir -p "$WORKSPACE" "$LOG_DIR"
 trap cleanup_artifacts EXIT
@@ -212,37 +214,51 @@ else
   LOOP_ARGS+=(--claude-first)
 fi
 
-LOOP_ARGS+=("${EXTRA_LOOP_ARGS[@]}")
+if [ "${#EXTRA_LOOP_ARGS[@]}" -gt 0 ]; then
+  LOOP_ARGS+=("${EXTRA_LOOP_ARGS[@]}")
+fi
 
 "$LOOP_SCRIPT" "${LOOP_ARGS[@]}"
 
 test -f "$WORKSPACE/smoke.txt" || die "missing smoke.txt in workspace"
 test -f "$WORKSPACE/.loop_state.md" || die "missing .loop_state.md"
 test -f "$WORKSPACE/.loop_state.json" || die "missing .loop_state.json"
-test -f "$ACTIVE_LOG_DIR/validation_iter1.log" || die "missing validation log"
 test -f "$ACTIVE_LOG_DIR/state/loop_state.md" || die "missing session loop_state.md mirror"
 test -f "$ACTIVE_LOG_DIR/state/loop_state.json" || die "missing session loop_state.json mirror"
+test -f "$RUN_SUMMARY_FILE" || die "missing run summary"
 
 expected_file="$(mktemp)"
 printf 'smoke test\n' > "$expected_file"
 cmp -s "$WORKSPACE/smoke.txt" "$expected_file" || die "smoke.txt content did not match expected output"
 rm -f "$expected_file"
 
-node - "$WORKSPACE/.loop_state.json" "$REQUIRE_CLAUDE_TURN" "$REQUIRE_CODEX_TURN" <<'EOF'
+FINAL_ITERATION="$(node - "$RUN_SUMMARY_FILE" "$MODE" "$REQUIRE_CLAUDE_TURN" "$REQUIRE_CODEX_TURN" <<'EOF'
 const fs = require("fs");
 
-const [statePath, requireClaudeTurn, requireCodexTurn] = process.argv.slice(2);
-const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+const [summaryPath, mode, requireClaudeTurn, requireCodexTurn] = process.argv.slice(2);
+const summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
 
-if (state.currentStatus.validationStatus !== "passed") {
-  throw new Error(`expected validationStatus=passed, got ${state.currentStatus.validationStatus}`);
+if (!summary.session || summary.session.mode !== mode) {
+  throw new Error(`expected summary.session.mode=${mode}, got ${summary.session && summary.session.mode}`);
 }
 
-if (!Array.isArray(state.iterations) || state.iterations.length === 0) {
-  throw new Error("expected at least one iteration record");
+if (!summary.healthChecks || !summary.healthChecks.node) {
+  throw new Error("missing healthChecks section in run summary");
 }
 
-const last = state.iterations[state.iterations.length - 1];
+if (summary.validation.status !== "passed") {
+  throw new Error(`expected validation.status=passed, got ${summary.validation.status}`);
+}
+
+if (!Number.isInteger(summary.iterationsCompleted) || summary.iterationsCompleted < 1) {
+  throw new Error(`expected iterationsCompleted >= 1, got ${summary.iterationsCompleted}`);
+}
+
+if (!summary.lastIteration || summary.lastIteration.iteration !== summary.iterationsCompleted) {
+  throw new Error("run summary lastIteration did not match iterationsCompleted");
+}
+
+const last = summary.lastIteration;
 const claude = last.agents.find((agent) => agent.name === "Claude Code");
 const codex = last.agents.find((agent) => agent.name === "Codex");
 
@@ -257,10 +273,27 @@ if (requireClaudeTurn === "1" && claude.status !== "completed") {
 if (requireCodexTurn === "1" && codex.status !== "completed") {
   throw new Error(`expected Codex turn to complete, got ${codex.status}`);
 }
+
+process.stdout.write(String(summary.iterationsCompleted));
 EOF
+)"
+
+[ -n "$FINAL_ITERATION" ] || die "failed to resolve final iteration from run summary"
+test -f "$ACTIVE_LOG_DIR/validation_iter${FINAL_ITERATION}.log" || die "missing validation log for final iteration"
+
+if [ "$MODE" = "mcp" ]; then
+  test -f "$ACTIVE_LOG_DIR/claude_mcp_iter${FINAL_ITERATION}.log" || die "missing Claude MCP log for final iteration"
+  test -f "$ACTIVE_LOG_DIR/codex_mcp_iter${FINAL_ITERATION}.log" || die "missing Codex MCP log for final iteration"
+else
+  test -f "$ACTIVE_LOG_DIR/claude_iter${FINAL_ITERATION}.log" || die "missing Claude log for final iteration"
+  test -f "$ACTIVE_LOG_DIR/codex_iter${FINAL_ITERATION}.log" || die "missing Codex log for final iteration"
+fi
+
+SUCCESS=1
 
 echo ""
 echo "E2E smoke test passed."
 echo "  workspace: $WORKSPACE"
 echo "  state: $WORKSPACE/.loop_state.md"
 echo "  logs: $ACTIVE_LOG_DIR"
+echo "  summary: $RUN_SUMMARY_FILE"
