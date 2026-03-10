@@ -186,7 +186,7 @@ validate_effort_settings() {
 }
 
 sanitize_name() {
-  printf '%s\n' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-'
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-'
 }
 
 apply_role_preset() {
@@ -723,7 +723,7 @@ ensure_claude_code_mcp() {
 }
 
 check_claude_status() {
-  local status=0 cmd=()
+  local status=0 cmd=() output="" reason_line=""
   CLAUDE_STATUS_REASON="ready"
 
   if ! command -v claude >/dev/null 2>&1; then
@@ -751,7 +751,7 @@ check_claude_status() {
   fi
   cmd+=("Reply with exactly: OK")
 
-  if run_with_timeout "$STATUS_CHECK_TIMEOUT" "${cmd[@]}" >/dev/null 2>&1; then
+  if output="$(run_with_timeout "$STATUS_CHECK_TIMEOUT" "${cmd[@]}" 2>&1)"; then
     return 0
   else
     status=$?
@@ -759,8 +759,15 @@ check_claude_status() {
 
   if [ "$status" -eq 124 ]; then
     CLAUDE_STATUS_REASON="account/usage check timed out"
+  elif printf '%s\n' "$output" | grep -qi "hit your limit"; then
+    CLAUDE_STATUS_REASON="usage limit hit; resets 10pm (Asia/Taipei)"
   else
-    CLAUDE_STATUS_REASON="account/usage check failed"
+    reason_line="$(printf '%s\n' "$output" | awk 'NF { print; exit }')"
+    if [ -n "$reason_line" ]; then
+      CLAUDE_STATUS_REASON="$reason_line"
+    else
+      CLAUDE_STATUS_REASON="account/usage check failed"
+    fi
   fi
   return 1
 }

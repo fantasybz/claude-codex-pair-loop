@@ -14,12 +14,25 @@ function readJsonl(path) {
     return [];
   }
 
-  return fs
-    .readFileSync(path, "utf8")
+  const raw = fs.readFileSync(path, "utf8").trim();
+  if (!raw) {
+    return [];
+  }
+
+  const lines = raw
     .split("\n")
     .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => JSON.parse(line));
+    .filter(Boolean);
+
+  try {
+    return lines.map((line) => JSON.parse(line));
+  } catch {
+    return raw
+      .split(/\n\s*\n/)
+      .map((block) => block.trim())
+      .filter(Boolean)
+      .map((block) => JSON.parse(block));
+  }
 }
 
 function renderAgent(agent) {
