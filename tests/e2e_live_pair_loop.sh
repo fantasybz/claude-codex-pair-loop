@@ -221,11 +221,14 @@ fi
 "$LOOP_SCRIPT" "${LOOP_ARGS[@]}"
 
 test -f "$WORKSPACE/smoke.txt" || die "missing smoke.txt in workspace"
-test -f "$WORKSPACE/.loop_state.md" || die "missing .loop_state.md"
-test -f "$WORKSPACE/.loop_state.json" || die "missing .loop_state.json"
 test -f "$ACTIVE_LOG_DIR/state/loop_state.md" || die "missing session loop_state.md mirror"
 test -f "$ACTIVE_LOG_DIR/state/loop_state.json" || die "missing session loop_state.json mirror"
 test -f "$RUN_SUMMARY_FILE" || die "missing run summary"
+[ ! -e "$WORKSPACE/.loop_state.md" ] || die "workspace should not contain .loop_state.md"
+[ ! -e "$WORKSPACE/.loop_state.json" ] || die "workspace should not contain .loop_state.json"
+if find "$WORKSPACE" -maxdepth 1 -type f \( -name 'claude_handoff_iter*.md' -o -name 'codex_handoff_iter*.md' -o -name 'claude_mcp_handoff_iter*.md' -o -name 'codex_mcp_handoff_iter*.md' \) | grep -q .; then
+  die "workspace should not contain handoff markdown files"
+fi
 
 expected_file="$(mktemp)"
 printf 'smoke test\n' > "$expected_file"
@@ -294,6 +297,6 @@ SUCCESS=1
 echo ""
 echo "E2E smoke test passed."
 echo "  workspace: $WORKSPACE"
-echo "  state: $WORKSPACE/.loop_state.md"
+echo "  state: $ACTIVE_LOG_DIR/state/loop_state.md"
 echo "  logs: $ACTIVE_LOG_DIR"
 echo "  summary: $RUN_SUMMARY_FILE"

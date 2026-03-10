@@ -22,9 +22,26 @@ extract_iteration() {
   printf '%s\n' "$1" | tr '\n' ' ' | sed -n 's/.*iteration \([0-9][0-9]*\).*/\1/p' | head -n 1
 }
 
+resolve_state_file() {
+  local workdir="$1"
+
+  if [ -n "${PAIR_LOOP_STATE_FILE:-}" ]; then
+    printf '%s\n' "$PAIR_LOOP_STATE_FILE"
+    return 0
+  fi
+
+  if [ -f "$workdir/.loop_state.md" ]; then
+    printf '%s\n' "$workdir/.loop_state.md"
+    return 0
+  fi
+
+  find "$(dirname "$workdir")" -path '*/state/loop_state.md' -type f | head -n 1
+}
+
 mark_success_criteria() {
   local workdir="$1"
-  local state_file="$workdir/.loop_state.md"
+  local state_file
+  state_file="$(resolve_state_file "$workdir")"
   [ -f "$state_file" ] || return 0
   perl -0pi -e 's/^- \[ \]/- [x]/mg' "$state_file"
 }

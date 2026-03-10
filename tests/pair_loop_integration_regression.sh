@@ -267,7 +267,7 @@ run_metadata_and_state_case() {
   log_dir="$tmp_dir/logs"
   session="metadata-case"
   summary_file="$log_dir/$session/run_summary.json"
-  state_json="$workspace/.loop_state.json"
+  state_json="$log_dir/$session/state/loop_state.json"
 
   make_fake_bin "$fake_bin"
 
@@ -298,6 +298,11 @@ run_metadata_and_state_case() {
   grep -q '## State Snapshot' "$log_dir/$session/claude_handoff_iter1.md" || die "expected structured state snapshot in Claude handoff"
   if grep -q '## State File Tail' "$log_dir/$session/claude_handoff_iter1.md"; then
     die "Claude handoff should not include raw state tails"
+  fi
+  [ ! -e "$workspace/.loop_state.md" ] || die "workspace should not contain .loop_state.md"
+  [ ! -e "$workspace/.loop_state.json" ] || die "workspace should not contain .loop_state.json"
+  if find "$workspace" -maxdepth 1 -type f \( -name 'claude_handoff_iter*.md' -o -name 'codex_handoff_iter*.md' -o -name 'claude_mcp_handoff_iter*.md' -o -name 'codex_mcp_handoff_iter*.md' \) | grep -q .; then
+    die "workspace should not contain handoff markdown files"
   fi
 
   node - "$summary_file" "$state_json" <<'EOF'

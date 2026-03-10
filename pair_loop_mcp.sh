@@ -246,6 +246,10 @@ ensure_workspace_git_excludes() {
   mkdir -p "$(dirname "$exclude_file")"
   append_unique_line "$exclude_file" ".loop_state.md"
   append_unique_line "$exclude_file" ".loop_state.json"
+  append_unique_line "$exclude_file" "claude_handoff_iter*.md"
+  append_unique_line "$exclude_file" "codex_handoff_iter*.md"
+  append_unique_line "$exclude_file" "claude_mcp_handoff_iter*.md"
+  append_unique_line "$exclude_file" "codex_mcp_handoff_iter*.md"
 }
 
 ensure_workspace_git_identity() {
@@ -257,9 +261,8 @@ ensure_workspace_git_identity() {
   fi
 }
 
-prepare_session_layout() {
-  local session_slug meta_file
-
+resolve_session_layout() {
+  local session_slug
   ACTIVE_LOG_DIR="$LOG_DIR"
   if [ -n "$SESSION_NAME" ]; then
     session_slug="$(sanitize_name "$SESSION_NAME")"
@@ -269,8 +272,16 @@ prepare_session_layout() {
   fi
 
   SESSION_STATE_DIR="$ACTIVE_LOG_DIR/state"
+  STATE_FILE="$SESSION_STATE_DIR/loop_state.md"
+  STATE_JSON_FILE="$SESSION_STATE_DIR/loop_state.json"
   ITERATION_HISTORY_FILE="$SESSION_STATE_DIR/iteration_history.jsonl"
   RUN_SUMMARY_FILE="$ACTIVE_LOG_DIR/run_summary.json"
+}
+
+prepare_session_layout() {
+  local meta_file
+
+  resolve_session_layout
   mkdir -p "$ACTIVE_LOG_DIR" "$SESSION_STATE_DIR"
 
   meta_file="$SESSION_STATE_DIR/session_meta.env"
@@ -310,11 +321,48 @@ section_to_temp_file() {
 }
 
 sync_state_session_mirrors() {
-  [ -d "$SESSION_STATE_DIR" ] || return 0
-  [ -f "$STATE_FILE" ] || return 0
-  [ -f "$STATE_JSON_FILE" ] || return 0
-  cp "$STATE_FILE" "$SESSION_STATE_DIR/loop_state.md"
-  cp "$STATE_JSON_FILE" "$SESSION_STATE_DIR/loop_state.json"
+  [ -d "$SESSION_STATE_DIR" ] || mkdir -p "$SESSION_STATE_DIR"
+}
+
+relocate_workspace_runtime_files() {
+  local src base dest
+
+  [ -d "$WORKSPACE" ] || return 0
+  mkdir -p "$ACTIVE_LOG_DIR" "$SESSION_STATE_DIR"
+
+  for src in \
+    "$WORKSPACE/.loop_state.md" \
+    "$WORKSPACE/.loop_state.json" \
+    "$WORKSPACE"/claude_handoff_iter*.md \
+    "$WORKSPACE"/codex_handoff_iter*.md \
+    "$WORKSPACE"/claude_mcp_handoff_iter*.md \
+    "$WORKSPACE"/codex_mcp_handoff_iter*.md; do
+    [ -e "$src" ] || continue
+    base="$(basename "$src")"
+    case "$base" in
+      .loop_state.md)
+        if [ -f "$STATE_FILE" ]; then
+          rm -f "$src"
+        else
+          mv "$src" "$STATE_FILE"
+        fi
+        ;;
+      .loop_state.json)
+        if [ -f "$STATE_JSON_FILE" ]; then
+          rm -f "$src"
+        else
+          mv "$src" "$STATE_JSON_FILE"
+        fi
+        ;;
+      *)
+        dest="$ACTIVE_LOG_DIR/$base"
+        if [ -e "$dest" ]; then
+          dest="$ACTIVE_LOG_DIR/${base%.md}.workspace-copy.md"
+        fi
+        mv "$src" "$dest"
+        ;;
+    esac
+  done
 }
 
 render_state_files() {
@@ -1234,12 +1282,16 @@ print_status_line() {
 
 read_state_task() {
   local source_file="$STATE_FILE"
+  local legacy_source_file="$WORKSPACE/.loop_state.md"
   if [ -n "$SESSION_NAME" ]; then
     local session_state_file
     session_state_file="$LOG_DIR/$(sanitize_name "$SESSION_NAME")/state/loop_state.md"
     if [ -f "$session_state_file" ]; then
       source_file="$session_state_file"
     fi
+  fi
+  if [ ! -f "$source_file" ] && [ -f "$legacy_source_file" ]; then
+    source_file="$legacy_source_file"
   fi
   [ -f "$source_file" ] || return 0
   awk '
@@ -1294,6 +1346,7 @@ prepare_workspace_and_logs() {
     git -C "$WORKSPACE" init -q
   fi
   ensure_workspace_git_excludes
+  relocate_workspace_runtime_files
 
   if [ ! -f "$STATE_FILE" ] || [ ! -f "$STATE_JSON_FILE" ]; then
     init_state_file
@@ -1341,6 +1394,12 @@ workspace_snapshot() {
         ! -path './.git/*' \
         ! -path './__pycache__/*' \
         ! -name '*.pyc' \
+        ! -name '.loop_state.md' \
+        ! -name '.loop_state.json' \
+        ! -name 'claude_handoff_iter*.md' \
+        ! -name 'codex_handoff_iter*.md' \
+        ! -name 'claude_mcp_handoff_iter*.md' \
+        ! -name 'codex_mcp_handoff_iter*.md' \
         | sed 's|^\./|  - |' \
         | sort
   )"
@@ -1358,7 +1417,17 @@ snapshot_workspace() {
 
   (
     cd "$WORKSPACE"
-    tar --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' -cf - .
+    tar \
+      --exclude='.git' \
+      --exclude='__pycache__' \
+      --exclude='*.pyc' \
+      --exclude='.loop_state.md' \
+      --exclude='.loop_state.json' \
+      --exclude='claude_handoff_iter*.md' \
+      --exclude='codex_handoff_iter*.md' \
+      --exclude='claude_mcp_handoff_iter*.md' \
+      --exclude='codex_mcp_handoff_iter*.md' \
+      -cf - .
   ) | (
     cd "$destination"
     tar -xf -
@@ -1566,7 +1635,7 @@ run_claude() {
   if [ "$TURN_TIMEOUT" -gt 0 ]; then
     if (
       cd "$WORKSPACE" &&
-      run_with_timeout "$TURN_TIMEOUT" "${cmd[@]}"
+      PAIR_LOOP_STATE_FILE="$STATE_FILE" run_with_timeout "$TURN_TIMEOUT" "${cmd[@]}"
     ) > "$raw_log" 2>&1; then
       status=0
     else
@@ -1575,7 +1644,7 @@ run_claude() {
   else
     if (
       cd "$WORKSPACE" &&
-      "${cmd[@]}"
+      PAIR_LOOP_STATE_FILE="$STATE_FILE" "${cmd[@]}"
     ) > "$raw_log" 2>&1; then
       status=0
     else
@@ -1642,13 +1711,13 @@ run_codex() {
   CODEX_RESOLVED_EFFORT=""
 
   if [ "$TURN_TIMEOUT" -gt 0 ]; then
-    if run_with_timeout "$TURN_TIMEOUT" "${cmd[@]}" > "$raw_log" 2>&1; then
+    if PAIR_LOOP_STATE_FILE="$STATE_FILE" run_with_timeout "$TURN_TIMEOUT" "${cmd[@]}" > "$raw_log" 2>&1; then
       status=0
     else
       status=$?
     fi
   else
-    if "${cmd[@]}" > "$raw_log" 2>&1; then
+    if PAIR_LOOP_STATE_FILE="$STATE_FILE" "${cmd[@]}" > "$raw_log" 2>&1; then
       status=0
     else
       status=$?
@@ -1711,7 +1780,7 @@ $files_snapshot
 
 ## Your workflow:
 
-1. Read .loop_state.md and review the workspace.
+1. Read $STATE_FILE and review the workspace.
    - Update Success Criteria, File Focus, Open Decisions, and Risks when useful.
    - Do not rewrite Current Status, Next Handoff, or Iteration Ledger; the loop script regenerates them.
 2. Do your part: implement, fix bugs, add tests, improve docs, or refactor.
@@ -1740,7 +1809,7 @@ $files_snapshot
 
 ## Your workflow:
 
-1. Read .loop_state.md and review the workspace.
+1. Read $STATE_FILE and review the workspace.
    - Update Success Criteria, File Focus, Open Decisions, and Risks when useful.
    - Do not rewrite Current Status, Next Handoff, or Iteration Ledger; the loop script regenerates them.
 2. Do your part: implement, fix bugs, add tests, improve docs, or refactor.
@@ -1776,6 +1845,7 @@ Build incrementally. Do not rewrite everything."
     echo ""
   fi
 
+  relocate_workspace_runtime_files
   snapshot_workspace "$tmp_root/after"
   CLAUDE_CHANGED_FILES="$(format_changed_files "$tmp_root/before" "$tmp_root/after")"
   if [ "$CODEX_AVAILABLE" -eq 1 ]; then
@@ -1833,7 +1903,7 @@ $files_snapshot
 
 ## Your workflow:
 
-1. Read .loop_state.md and review the workspace.
+1. Read $STATE_FILE and review the workspace.
    - Update Success Criteria, File Focus, Open Decisions, and Risks when useful.
    - Do not rewrite Current Status, Next Handoff, or Iteration Ledger; the loop script regenerates them.
 2. Do your part: improve code, fix bugs, add tests, or refactor.
@@ -1862,7 +1932,7 @@ $files_snapshot
 
 ## Your workflow:
 
-1. Read .loop_state.md and review the workspace.
+1. Read $STATE_FILE and review the workspace.
    - Update Success Criteria, File Focus, Open Decisions, and Risks when useful.
    - Do not rewrite Current Status, Next Handoff, or Iteration Ledger; the loop script regenerates them.
 2. Do your part: improve code, fix bugs, add tests, or refactor.
@@ -1898,6 +1968,7 @@ Build incrementally. Do not rewrite everything."
     echo ""
   fi
 
+  relocate_workspace_runtime_files
   snapshot_workspace "$tmp_root/after"
   CODEX_CHANGED_FILES="$(format_changed_files "$tmp_root/before" "$tmp_root/after")"
   if [ "$CLAUDE_AVAILABLE" -eq 1 ]; then
@@ -2191,8 +2262,7 @@ parse_args() {
 parse_args "$@"
 WORKSPACE="$(abs_path "$WORKSPACE")"
 LOG_DIR="$(abs_path "$LOG_DIR")"
-STATE_FILE="$WORKSPACE/.loop_state.md"
-STATE_JSON_FILE="$WORKSPACE/.loop_state.json"
+resolve_session_layout
 prepare_task
 run_startup_health_checks
 if [ "$HEALTHCHECK_ONLY" -eq 1 ]; then

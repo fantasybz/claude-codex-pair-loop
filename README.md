@@ -190,7 +190,7 @@ At startup, both scripts:
 2. Run startup health checks for Claude, Codex, Node.js, and MCP availability.
 3. Clean or preserve `workspace/` and `logs/` based on the selected flags.
 4. Ensure the workspace is a Git repository because Codex expects one.
-5. Create or reuse structured state files at `workspace/.loop_state.md` and `workspace/.loop_state.json`.
+5. Create or reuse structured state files under `logs/.../state/loop_state.md` and `logs/.../state/loop_state.json`.
 6. Initialize `run_summary.json` for the active session.
 
 During each iteration:
@@ -214,8 +214,8 @@ If a check fails, the runner writes a skip log and continues with the next avail
 
 Primary runtime artifacts:
 
-- `workspace/.loop_state.md`: human-readable loop state
-- `workspace/.loop_state.json`: machine-readable loop state
+- `logs/.../state/loop_state.md`: human-readable loop state
+- `logs/.../state/loop_state.json`: machine-readable loop state
 - `logs/.../*.log`: per-turn and validation logs
 - `logs/.../*handoff_iterN.md`: handoff summaries between turns
 - `logs/.../run_summary.json`: runner-owned final summary for the session
@@ -223,11 +223,12 @@ Primary runtime artifacts:
 
 State behavior:
 
-- `.loop_state.md` preserves human-managed sections such as Success Criteria, File Focus, Open Decisions, and Risks.
+- `loop_state.md` preserves human-managed sections such as Success Criteria, File Focus, Open Decisions, and Risks.
 - The runner regenerates Session, Current Status, Next Handoff, Iteration Ledger, and stop-condition status.
 - Handoff files are diff-aware. They include a change summary, current Git status, workspace snapshot, and a runner-owned state snapshot.
 - Turn logs record both configured and resolved runtime model and effort when the underlying CLI exposes those values.
-- `.loop_state.json` and `run_summary.json` split stop-condition data into `configured`, `current`, and `summary` so tooling can distinguish enabled checks from checks that are currently met.
+- `loop_state.json` and `run_summary.json` split stop-condition data into `configured`, `current`, and `summary` so tooling can distinguish enabled checks from checks that are currently met.
+- The workspace is reserved for generated project files. Runner state and handoff artifacts are kept under `logs/`.
 
 Session behavior:
 
@@ -315,7 +316,7 @@ What it does:
 - runs `pair_loop.sh` by default, or `pair_loop_mcp.sh` with `--mode mcp`
 - uses a throwaway workspace and log directory under `/tmp`
 - asks the loop to create `smoke.txt` with exact content
-- verifies `workspace/.loop_state.md`, `workspace/.loop_state.json`, final-iteration validation logs, session-state mirrors, and `run_summary.json`
+- verifies the state files under `logs/.../state/`, final-iteration validation logs, and `run_summary.json`
 - checks the runner-owned summary to confirm validation finished with `passed`
 - removes generated artifacts only when `--cleanup` is requested and the run succeeds
 
