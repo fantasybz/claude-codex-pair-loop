@@ -20,7 +20,7 @@ This README documents the two launcher scripts in this repository and the wrappe
 
 At startup, both scripts now do the following:
 
-1. Parse flags such as `--workspace`, `--log-dir`, `--resume`, `--keep-logs`, and `--non-destructive`.
+1. Parse flags such as `--workspace`, `--log-dir`, `--profile`, `--claude-model`, `--codex-model`, `--resume`, `--keep-logs`, and `--non-destructive`.
 2. Run up-front health checks for Claude, Codex, Node.js, and MCP availability.
 3. Clean or preserve `workspace/` and `logs/` based on the selected flags.
 4. Ensure the workspace is a Git repository because Codex expects one.
@@ -119,6 +119,24 @@ Run with Codex starting first:
 ./pair_loop.sh --codex-first --task "Improve an existing CLI tool"
 ```
 
+Run with a deeper reasoning preset:
+
+```bash
+./pair_loop.sh --deep --task "Refactor and harden this service"
+```
+
+Run with explicit model and effort settings:
+
+```bash
+./pair_loop_mcp.sh \
+  --claude-model sonnet \
+  --claude-effort high \
+  --codex-model gpt-5.3-codex \
+  --codex-effort xhigh \
+  --task "Continue the current project" \
+  --resume
+```
+
 Run through the generated skill wrappers:
 
 ```bash
@@ -141,6 +159,12 @@ Supported flags:
 - `--log-dir PATH`: use a custom log directory
 - `--task TEXT`: pass the task as a flag instead of a positional argument
 - `--max-iterations N`: pass the iteration count as a flag
+- `--profile fast|balanced|deep`: set effort defaults for both agents
+- `--fast`, `--balanced`, `--deep`: aliases for `--profile`
+- `--claude-model MODEL`: choose the Claude model for each Claude turn
+- `--codex-model MODEL`: choose the Codex model for each Codex turn
+- `--claude-effort low|medium|high`: choose Claude effort level
+- `--codex-effort low|medium|high|xhigh`: choose Codex reasoning effort
 - `--first-agent claude|codex`: choose which agent starts each iteration
 - `--claude-first`: alias for `--first-agent claude`
 - `--codex-first`: alias for `--first-agent codex`
@@ -150,6 +174,13 @@ Supported flags:
 - `--non-destructive`: preserve both workspace and logs
 
 `--resume` implies preserving both workspace and logs.
+
+Notes on model and effort settings:
+
+- The profile presets only affect effort defaults. They do not force a specific model.
+- Explicit `--claude-effort` or `--codex-effort` overrides the profile default for that agent.
+- Claude effort is passed through as the native `claude --effort` option.
+- Codex effort is passed through as `codex exec -c model_reasoning_effort="..."`.
 
 ## Runtime output
 
@@ -164,6 +195,7 @@ The terminal output also prints:
 - the active task
 - the workspace path
 - the log directory path
+- the active profile, model, and effort settings
 - the current iteration number
 - the log file paths for each completed iteration
 
@@ -194,7 +226,7 @@ Each skill contains:
 - `agents/openai.yaml`: agent metadata
 - `scripts/run-pair-loop.sh`: a wrapper that selects standard or MCP mode and injects the fixed first-agent flag
 
-The wrapper scripts accept the same core flags as the underlying tools. Pass `--mcp` to switch from standard mode to MCP mode.
+The wrapper scripts accept the same core flags as the underlying tools, including `--profile`, `--claude-model`, `--codex-model`, `--claude-effort`, and `--codex-effort`. Pass `--mcp` to switch from standard mode to MCP mode.
 
 ## `pair_loop_mcp.sh` details
 

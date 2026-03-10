@@ -9,9 +9,17 @@
 #   --log-dir PATH          Log directory (default: ./logs)
 #   --task TEXT             Task description
 #   --max-iterations N      Maximum iterations (default: 999999)
+#   --profile NAME          Effort preset: fast, balanced, or deep
+#   --claude-model MODEL    Claude model override
+#   --codex-model MODEL     Codex model override
+#   --claude-effort LEVEL   Claude effort: low, medium, or high
+#   --codex-effort LEVEL    Codex effort: low, medium, high, or xhigh
 #   --first-agent NAME      Turn order: claude or codex (default: claude)
 #   --claude-first          Alias for --first-agent claude
 #   --codex-first           Alias for --first-agent codex
+#   --fast                  Alias for --profile fast
+#   --balanced              Alias for --profile balanced
+#   --deep                  Alias for --profile deep
 #   --resume                Resume from existing workspace/logs without cleaning
 #   --keep-logs             Preserve existing logs on startup
 #   --keep-workspace        Preserve existing workspace on startup
@@ -34,6 +42,11 @@ STATUS_CHECK_TIMEOUT="${STATUS_CHECK_TIMEOUT:-20}"
 RESUME=0
 KEEP_LOGS=0
 KEEP_WORKSPACE=0
+PROFILE=""
+CLAUDE_MODEL=""
+CLAUDE_EFFORT=""
+CODEX_MODEL=""
+CODEX_EFFORT=""
 TASK_FROM_FLAG=0
 MAX_ITERATIONS_FROM_FLAG=0
 ITERATION=0
@@ -60,7 +73,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 usage() {
-  sed -n '1,20p' "$0"
+  sed -n '1,28p' "$0"
 }
 
 die() {
@@ -72,6 +85,54 @@ abs_path() {
   case "$1" in
     /*) printf '%s\n' "$1" ;;
     *) printf '%s\n' "$PWD/$1" ;;
+  esac
+}
+
+display_value() {
+  if [ -n "$1" ]; then
+    printf '%s\n' "$1"
+  else
+    printf '%s\n' "$2"
+  fi
+}
+
+apply_profile_defaults() {
+  case "$PROFILE" in
+    "")
+      ;;
+    fast)
+      [ -n "$CLAUDE_EFFORT" ] || CLAUDE_EFFORT="low"
+      [ -n "$CODEX_EFFORT" ] || CODEX_EFFORT="low"
+      ;;
+    balanced)
+      [ -n "$CLAUDE_EFFORT" ] || CLAUDE_EFFORT="medium"
+      [ -n "$CODEX_EFFORT" ] || CODEX_EFFORT="medium"
+      ;;
+    deep)
+      [ -n "$CLAUDE_EFFORT" ] || CLAUDE_EFFORT="high"
+      [ -n "$CODEX_EFFORT" ] || CODEX_EFFORT="high"
+      ;;
+    *)
+      die "profile must be one of: fast, balanced, deep"
+      ;;
+  esac
+}
+
+validate_effort_settings() {
+  case "$CLAUDE_EFFORT" in
+    ""|low|medium|high)
+      ;;
+    *)
+      die "claude effort must be one of: low, medium, high"
+      ;;
+  esac
+
+  case "$CODEX_EFFORT" in
+    ""|low|medium|high|xhigh)
+      ;;
+    *)
+      die "codex effort must be one of: low, medium, high, xhigh"
+      ;;
   esac
 }
 
@@ -135,7 +196,7 @@ check_node_status() {
 }
 
 check_claude_status() {
-  local status=0
+  local status=0 cmd=()
   CLAUDE_STATUS_REASON="ready"
 
   if ! command -v claude >/dev/null 2>&1; then
@@ -143,13 +204,22 @@ check_claude_status() {
     return 1
   fi
 
-  if run_with_timeout "$STATUS_CHECK_TIMEOUT" \
-    claude -p \
-      --dangerously-skip-permissions \
-      --no-session-persistence \
-      --tools "" \
-      --output-format text \
-      "Reply with exactly: OK" >/dev/null 2>&1; then
+  cmd=(
+    claude -p
+    --dangerously-skip-permissions
+    --no-session-persistence
+    --tools ""
+    --output-format text
+  )
+  if [ -n "$CLAUDE_MODEL" ]; then
+    cmd+=(--model "$CLAUDE_MODEL")
+  fi
+  if [ -n "$CLAUDE_EFFORT" ]; then
+    cmd+=(--effort "$CLAUDE_EFFORT")
+  fi
+  cmd+=("Reply with exactly: OK")
+
+  if run_with_timeout "$STATUS_CHECK_TIMEOUT" "${cmd[@]}" >/dev/null 2>&1; then
     return 0
   else
     status=$?
@@ -463,17 +533,28 @@ EOF
 run_claude() {
   local prompt="$1"
   local log_file="$LOG_DIR/claude_iter${ITERATION}.log"
+  local cmd=()
 
   echo -e "${GREEN}🤖 [Claude Code] Iteration $ITERATION${NC}"
   echo -e "${GREEN}   Prompt:${NC} ${prompt:0:120}..."
   echo ""
 
+  cmd=(
+    claude -p
+    --dangerously-skip-permissions
+    --output-format text
+  )
+  if [ -n "$CLAUDE_MODEL" ]; then
+    cmd+=(--model "$CLAUDE_MODEL")
+  fi
+  if [ -n "$CLAUDE_EFFORT" ]; then
+    cmd+=(--effort "$CLAUDE_EFFORT")
+  fi
+  cmd+=("$prompt")
+
   (
     cd "$WORKSPACE" &&
-    claude -p \
-      --dangerously-skip-permissions \
-      --output-format text \
-      "$prompt"
+    "${cmd[@]}"
   ) 2>&1 | tee "$log_file"
 
   echo ""
@@ -482,15 +563,26 @@ run_claude() {
 run_codex() {
   local prompt="$1"
   local log_file="$LOG_DIR/codex_iter${ITERATION}.log"
+  local cmd=()
 
   echo -e "${BLUE}🧠 [Codex] Iteration $ITERATION${NC}"
   echo -e "${BLUE}   Prompt:${NC} ${prompt:0:120}..."
   echo ""
 
-  codex exec --full-auto \
-    -C "$WORKSPACE" \
-    "$prompt" \
-    2>&1 | tee "$log_file"
+  cmd=(
+    codex exec
+    --full-auto
+    -C "$WORKSPACE"
+  )
+  if [ -n "$CODEX_MODEL" ]; then
+    cmd+=(--model "$CODEX_MODEL")
+  fi
+  if [ -n "$CODEX_EFFORT" ]; then
+    cmd+=(-c "model_reasoning_effort=\"$CODEX_EFFORT\"")
+  fi
+  cmd+=("$prompt")
+
+  "${cmd[@]}" 2>&1 | tee "$log_file"
 
   echo ""
 }
@@ -711,6 +803,31 @@ parse_args() {
         MAX_ITERATIONS_FROM_FLAG=1
         shift 2
         ;;
+      --profile)
+        [ "$#" -ge 2 ] || die "--profile requires a value"
+        PROFILE="$2"
+        shift 2
+        ;;
+      --claude-model)
+        [ "$#" -ge 2 ] || die "--claude-model requires a value"
+        CLAUDE_MODEL="$2"
+        shift 2
+        ;;
+      --codex-model)
+        [ "$#" -ge 2 ] || die "--codex-model requires a value"
+        CODEX_MODEL="$2"
+        shift 2
+        ;;
+      --claude-effort)
+        [ "$#" -ge 2 ] || die "--claude-effort requires a value"
+        CLAUDE_EFFORT="$2"
+        shift 2
+        ;;
+      --codex-effort)
+        [ "$#" -ge 2 ] || die "--codex-effort requires a value"
+        CODEX_EFFORT="$2"
+        shift 2
+        ;;
       --first-agent)
         [ "$#" -ge 2 ] || die "--first-agent requires a value"
         FIRST_AGENT="$2"
@@ -741,6 +858,18 @@ parse_args() {
       --non-destructive|--preserve)
         KEEP_LOGS=1
         KEEP_WORKSPACE=1
+        shift
+        ;;
+      --fast)
+        PROFILE="fast"
+        shift
+        ;;
+      --balanced)
+        PROFILE="balanced"
+        shift
+        ;;
+      --deep)
+        PROFILE="deep"
         shift
         ;;
       -h|--help)
@@ -789,6 +918,9 @@ parse_args() {
       die "first agent must be either 'claude' or 'codex'"
       ;;
   esac
+
+  apply_profile_defaults
+  validate_effort_settings
 }
 
 parse_args "$@"
@@ -811,6 +943,11 @@ echo -e "${YELLOW}Task:${NC} $TASK"
 echo -e "${YELLOW}Workspace:${NC} $WORKSPACE"
 echo -e "${YELLOW}Log dir:${NC} $LOG_DIR"
 echo -e "${YELLOW}Max iterations:${NC} $MAX_ITERATIONS"
+echo -e "${YELLOW}Profile:${NC} $(display_value "$PROFILE" "custom")"
+echo -e "${YELLOW}Claude model:${NC} $(display_value "$CLAUDE_MODEL" "default")"
+echo -e "${YELLOW}Claude effort:${NC} $(display_value "$CLAUDE_EFFORT" "default")"
+echo -e "${YELLOW}Codex model:${NC} $(display_value "$CODEX_MODEL" "default")"
+echo -e "${YELLOW}Codex effort:${NC} $(display_value "$CODEX_EFFORT" "default")"
 echo -e "${YELLOW}First agent:${NC} $FIRST_AGENT"
 echo -e "${YELLOW}Resume mode:${NC} $RESUME"
 echo -e "${YELLOW}Keep workspace:${NC} $KEEP_WORKSPACE"

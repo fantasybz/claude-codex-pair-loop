@@ -19,6 +19,7 @@ Launch the repository pair-loop scripts with the turn order fixed to Claude-firs
    - Use `--resume` to continue an existing run.
    - Use `--non-destructive` when the user wants to keep current `workspace/` and `logs/`.
    - Only start destructive fresh runs when the user clearly wants a clean reset.
+   - Use `--profile`, `--claude-model`, `--codex-model`, `--claude-effort`, and `--codex-effort` when the user wants explicit model or reasoning control.
 4. Launch the wrapper script in `scripts/run-pair-loop.sh`.
 5. Inspect the generated logs and handoff files after the run if the user asks for results or debugging.
 
@@ -44,8 +45,14 @@ Resume mode:
 ./skills/claude-first-pair-loop/scripts/run-pair-loop.sh --resume --task "Continue the current project"
 ```
 
+Explicit model and effort control:
+
+```bash
+./skills/claude-first-pair-loop/scripts/run-pair-loop.sh --profile deep --claude-model sonnet --codex-model gpt-5.3-codex --codex-effort xhigh --task "Continue the current project"
+```
+
 ## Notes
 
 - The wrapper script automatically adds `--claude-first`.
 - Use the companion `codex-first-pair-loop` skill when the user wants Codex to lead instead.
-- The underlying repository scripts handle `--workspace`, `--log-dir`, `--resume`, `--keep-logs`, `--keep-workspace`, and `--non-destructive`.
+- The underlying repository scripts handle `--workspace`, `--log-dir`, `--profile`, `--claude-model`, `--codex-model`, `--claude-effort`, `--codex-effort`, `--resume`, `--keep-logs`, `--keep-workspace`, and `--non-destructive`.
