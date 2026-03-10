@@ -14,6 +14,18 @@
 #   --codex-model MODEL     Codex model override
 #   --claude-effort LEVEL   Claude effort: low, medium, or high
 #   --codex-effort LEVEL    Codex effort: low, medium, high, or xhigh
+#   --role-preset NAME      Role split: balanced, docs-refactor, reviewer-builder
+#   --session-name NAME     Group logs and state artifacts under a session-specific log directory
+#   --validation-command CMD
+#                          Validation command to run after each iteration
+#   --state-max-ledger-entries N
+#                          Number of recent iterations to keep expanded in .loop_state.md
+#   --until-tests-pass      Stop when validation succeeds
+#   --until-checklist-complete
+#                          Stop when all Success Criteria checkboxes are checked
+#   --until-clean-git       Stop when the workspace Git status is clean
+#   --checkpoint-commits    Create a checkpoint commit after each iteration when there are changes
+#   --checkpoint-tags       Create a checkpoint tag after each iteration
 #   --first-agent NAME      Turn order: claude or codex (default: claude)
 #   --claude-first          Alias for --first-agent claude
 #   --codex-first           Alias for --first-agent codex
@@ -47,13 +59,49 @@ CLAUDE_MODEL=""
 CLAUDE_EFFORT=""
 CODEX_MODEL=""
 CODEX_EFFORT=""
+MODE="standard"
+ROLE_PRESET="balanced"
+SESSION_NAME=""
+VALIDATION_COMMAND=""
+VALIDATION_COMMAND_USED=""
+STATE_MAX_LEDGER_ENTRIES="12"
+UNTIL_TESTS_PASS=0
+UNTIL_CHECKLIST_COMPLETE=0
+UNTIL_CLEAN_GIT=0
+CHECKPOINT_COMMITS=0
+CHECKPOINT_TAGS=0
 TASK_FROM_FLAG=0
 MAX_ITERATIONS_FROM_FLAG=0
 ITERATION=0
 RUN_START_ITERATION=0
 FIRST_ITERATION_OF_THIS_RUN=1
 STATE_FILE=""
+STATE_JSON_FILE=""
 EXISTING_TASK=""
+ACTIVE_LOG_DIR=""
+SESSION_STATE_DIR=""
+ITERATION_HISTORY_FILE=""
+RUN_STARTED_AT=""
+CURRENT_PHASE="starting"
+CURRENT_HEALTH="yellow"
+CURRENT_BLOCKER="none recorded"
+CURRENT_OWNER="unassigned"
+CURRENT_VALIDATION_STATUS="not-run"
+CURRENT_VALIDATION_REASON="No validation has run yet."
+STOP_CHECKS_SUMMARY="No stop conditions configured."
+NEXT_HANDOFF_CONTENT="- Waiting for the first completed turn."
+CLAUDE_ROLE_FOCUS=""
+CODEX_ROLE_FOCUS=""
+LAST_CHECKPOINT_STATUS="not-run"
+LAST_CHECKPOINT_REASON=""
+LAST_CHECKPOINT_REF=""
+VALIDATION_LOG=""
+CLAUDE_DURATION_SECONDS=0
+CLAUDE_EXIT_STATUS=0
+CLAUDE_CHANGED_FILES=""
+CODEX_DURATION_SECONDS=0
+CODEX_EXIT_STATUS=0
+CODEX_CHANGED_FILES=""
 
 STARTUP_NODE_AVAILABLE=0
 STARTUP_NODE_REASON=""
@@ -73,7 +121,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 usage() {
-  sed -n '1,28p' "$0"
+  sed -n '1,40p' "$0"
 }
 
 die() {
@@ -134,6 +182,458 @@ validate_effort_settings() {
       die "codex effort must be one of: low, medium, high, xhigh"
       ;;
   esac
+}
+
+sanitize_name() {
+  printf '%s\n' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-'
+}
+
+apply_role_preset() {
+  case "$ROLE_PRESET" in
+    balanced)
+      CLAUDE_ROLE_FOCUS="Prioritize correctness, tests, documentation, and reviewer-style feedback."
+      CODEX_ROLE_FOCUS="Prioritize implementation speed, refactoring, feature delivery, and performance."
+      ;;
+    docs-refactor)
+      CLAUDE_ROLE_FOCUS="Prioritize tests, docs, edge cases, and API clarity."
+      CODEX_ROLE_FOCUS="Prioritize implementation, refactoring, cleanup, and performance improvements."
+      ;;
+    reviewer-builder)
+      CLAUDE_ROLE_FOCUS="Act as the reviewer and planner: tighten tests, catch bugs, challenge weak designs, and improve docs."
+      CODEX_ROLE_FOCUS="Act as the builder: implement changes, wire features, and carry larger refactors."
+      ;;
+    *)
+      die "role preset must be one of: balanced, docs-refactor, reviewer-builder"
+      ;;
+  esac
+}
+
+append_unique_line() {
+  local file="$1"
+  local line="$2"
+  touch "$file"
+  if ! grep -Fxq "$line" "$file" 2>/dev/null; then
+    printf '%s\n' "$line" >> "$file"
+  fi
+}
+
+ensure_workspace_git_excludes() {
+  local exclude_file="$WORKSPACE/.git/info/exclude"
+  mkdir -p "$(dirname "$exclude_file")"
+  append_unique_line "$exclude_file" ".loop_state.md"
+  append_unique_line "$exclude_file" ".loop_state.json"
+}
+
+prepare_session_layout() {
+  local session_slug meta_file
+
+  ACTIVE_LOG_DIR="$LOG_DIR"
+  if [ -n "$SESSION_NAME" ]; then
+    session_slug="$(sanitize_name "$SESSION_NAME")"
+    [ -n "$session_slug" ] || die "session name must contain at least one alphanumeric character"
+    ACTIVE_LOG_DIR="$LOG_DIR/$session_slug"
+    SESSION_NAME="$session_slug"
+  fi
+
+  SESSION_STATE_DIR="$ACTIVE_LOG_DIR/state"
+  ITERATION_HISTORY_FILE="$SESSION_STATE_DIR/iteration_history.jsonl"
+  mkdir -p "$ACTIVE_LOG_DIR" "$SESSION_STATE_DIR"
+
+  meta_file="$SESSION_STATE_DIR/session_meta.env"
+  if [ -f "$meta_file" ]; then
+    # shellcheck disable=SC1090
+    . "$meta_file"
+  fi
+
+  if [ -z "$RUN_STARTED_AT" ]; then
+    RUN_STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
+    cat > "$meta_file" << EOF
+RUN_STARTED_AT='$RUN_STARTED_AT'
+EOF
+  fi
+}
+
+extract_state_section() {
+  local heading="$1"
+  [ -f "$STATE_FILE" ] || return 0
+  awk -v target="## ${heading}" '
+    $0 == target { capture = 1; next }
+    capture && /^## / { exit }
+    capture { print }
+  ' "$STATE_FILE"
+}
+
+section_to_temp_file() {
+  local heading="$1"
+  local default_value="$2"
+  local temp_file
+  temp_file="$(mktemp)"
+  extract_state_section "$heading" > "$temp_file"
+  if [ ! -s "$temp_file" ]; then
+    printf '%s\n' "$default_value" > "$temp_file"
+  fi
+  printf '%s\n' "$temp_file"
+}
+
+sync_state_session_mirrors() {
+  [ -d "$SESSION_STATE_DIR" ] || return 0
+  cp "$STATE_FILE" "$SESSION_STATE_DIR/loop_state.md"
+  cp "$STATE_JSON_FILE" "$SESSION_STATE_DIR/loop_state.json"
+}
+
+render_state_files() {
+  local success_file focus_file decisions_file risks_file
+
+  success_file="$(section_to_temp_file "Success Criteria" "- [ ] Core implementation works
+- [ ] Validation or tests pass
+- [ ] Usage notes or documentation are updated")"
+  focus_file="$(section_to_temp_file "File Focus" "- (update as needed)")"
+  decisions_file="$(section_to_temp_file "Open Decisions" "- (none recorded)")"
+  risks_file="$(section_to_temp_file "Risks" "- (none recorded)")"
+
+  TASK="$TASK" \
+  SESSION_NAME="$SESSION_NAME" \
+  MODE="$MODE" \
+  RUN_STARTED_AT="$RUN_STARTED_AT" \
+  FIRST_AGENT="$FIRST_AGENT" \
+  ROLE_PRESET="$ROLE_PRESET" \
+  WORKSPACE="$WORKSPACE" \
+  ACTIVE_LOG_DIR="$ACTIVE_LOG_DIR" \
+  CURRENT_PHASE="$CURRENT_PHASE" \
+  CURRENT_HEALTH="$CURRENT_HEALTH" \
+  CURRENT_BLOCKER="$CURRENT_BLOCKER" \
+  CURRENT_OWNER="$CURRENT_OWNER" \
+  CURRENT_VALIDATION_STATUS="$CURRENT_VALIDATION_STATUS" \
+  CURRENT_VALIDATION_REASON="$CURRENT_VALIDATION_REASON" \
+  STOP_CHECKS_SUMMARY="$STOP_CHECKS_SUMMARY" \
+  NEXT_HANDOFF_CONTENT="$NEXT_HANDOFF_CONTENT" \
+  UNTIL_TESTS_PASS="$UNTIL_TESTS_PASS" \
+  UNTIL_CHECKLIST_COMPLETE="$UNTIL_CHECKLIST_COMPLETE" \
+  UNTIL_CLEAN_GIT="$UNTIL_CLEAN_GIT" \
+  VALIDATION_COMMAND_USED="$VALIDATION_COMMAND_USED" \
+  STATE_MAX_LEDGER_ENTRIES="$STATE_MAX_LEDGER_ENTRIES" \
+    node "$SCRIPT_DIR/pair_loop_state_renderer.js" \
+      "$STATE_FILE" \
+      "$STATE_JSON_FILE" \
+      "$ITERATION_HISTORY_FILE" \
+      "$success_file" \
+      "$focus_file" \
+      "$decisions_file" \
+      "$risks_file"
+
+  rm -f "$success_file" "$focus_file" "$decisions_file" "$risks_file"
+  sync_state_session_mirrors
+}
+
+join_lines_with_comma() {
+  tr '\n' ',' | sed 's/,$//'
+}
+
+json_escape_inline() {
+  printf '%s' "$1" | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+changed_files_list() {
+  local before_snapshot="$1"
+  local after_snapshot="$2"
+  local before_list after_list file
+
+  before_list="$(mktemp)"
+  after_list="$(mktemp)"
+  list_snapshot_files "$before_snapshot" > "$before_list"
+  list_snapshot_files "$after_snapshot" > "$after_list"
+
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    printf '%s\n' "$file"
+  done < <(comm -13 "$before_list" "$after_list")
+
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    printf '%s\n' "$file"
+  done < <(comm -23 "$before_list" "$after_list")
+
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    if ! cmp -s "$before_snapshot/$file" "$after_snapshot/$file"; then
+      printf '%s\n' "$file"
+    fi
+  done < <(comm -12 "$before_list" "$after_list")
+
+  rm -f "$before_list" "$after_list"
+}
+
+format_changed_files() {
+  local before_snapshot="$1"
+  local after_snapshot="$2"
+  local files
+
+  files="$(changed_files_list "$before_snapshot" "$after_snapshot" | sort -u)"
+  if [ -n "$files" ]; then
+    printf '%s\n' "$files"
+  else
+    echo "none"
+  fi
+}
+
+set_next_handoff_content() {
+  local next_agent="$1"
+  local handoff_file="$2"
+  local changed_files="$3"
+  local role_focus="$4"
+
+  NEXT_HANDOFF_CONTENT="- Next agent: $next_agent
+- Review changed files: $(printf '%s\n' "$changed_files" | join_lines_with_comma)
+- Role focus: $role_focus
+- Handoff file: $handoff_file"
+}
+
+workspace_git_is_clean() {
+  local status
+  status="$(git -C "$WORKSPACE" status --short --untracked-files=normal 2>/dev/null || true)"
+  [ -z "$status" ]
+}
+
+detect_validation_command() {
+  if [ -n "$VALIDATION_COMMAND" ]; then
+    printf '%s\n' "$VALIDATION_COMMAND"
+    return 0
+  fi
+
+  if [ -f "$WORKSPACE/Makefile" ] && grep -q '^test:' "$WORKSPACE/Makefile" 2>/dev/null; then
+    echo "make test"
+    return 0
+  fi
+  if [ -f "$WORKSPACE/package.json" ] && command -v npm >/dev/null 2>&1; then
+    echo "npm test"
+    return 0
+  fi
+  if [ -f "$WORKSPACE/pyproject.toml" ] || [ -f "$WORKSPACE/pytest.ini" ] || [ -d "$WORKSPACE/tests" ]; then
+    if command -v pytest >/dev/null 2>&1; then
+      echo "pytest -q"
+      return 0
+    fi
+  fi
+  if [ -f "$WORKSPACE/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+    echo "cargo test"
+    return 0
+  fi
+  if [ -f "$WORKSPACE/go.mod" ] && command -v go >/dev/null 2>&1; then
+    echo "go test ./..."
+    return 0
+  fi
+
+  return 1
+}
+
+run_iteration_validation() {
+  local cmd status started_at ended_at duration
+  VALIDATION_LOG="$ACTIVE_LOG_DIR/validation_iter${ITERATION}.log"
+
+  if ! cmd="$(detect_validation_command)"; then
+    CURRENT_VALIDATION_STATUS="unavailable"
+    CURRENT_VALIDATION_REASON="No validation command configured or auto-detected."
+    VALIDATION_COMMAND_USED=""
+    VALIDATION_LOG=""
+    return 0
+  fi
+
+  VALIDATION_COMMAND_USED="$cmd"
+  started_at="$(date '+%Y-%m-%d %H:%M:%S')"
+  local start_seconds end_seconds
+  start_seconds="$(date +%s)"
+
+  if (
+    cd "$WORKSPACE" &&
+    bash -lc "$cmd"
+  ) > "$VALIDATION_LOG.raw" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+
+  end_seconds="$(date +%s)"
+  ended_at="$(date '+%Y-%m-%d %H:%M:%S')"
+  duration=$((end_seconds - start_seconds))
+
+  {
+    echo "# Validation Metrics"
+    echo "timestamp: $started_at"
+    echo "command: $cmd"
+    echo "duration_seconds: $duration"
+    echo "exit_status: $status"
+    echo "token_cost_info: unavailable"
+    echo
+    echo "# Raw Output"
+    cat "$VALIDATION_LOG.raw"
+  } > "$VALIDATION_LOG"
+  rm -f "$VALIDATION_LOG.raw"
+
+  if [ "$status" -eq 0 ]; then
+    CURRENT_VALIDATION_STATUS="passed"
+    CURRENT_VALIDATION_REASON="$cmd"
+  else
+    CURRENT_VALIDATION_STATUS="failed"
+    CURRENT_VALIDATION_REASON="$cmd exited with status $status"
+  fi
+}
+
+count_unchecked_success_criteria() {
+  extract_state_section "Success Criteria" | grep -c '^- \[ \]' || true
+}
+
+evaluate_stop_conditions() {
+  local reasons=() tests_met=1 checklist_met=1 clean_git_met=1 unchecked_count=0
+
+  if [ "$UNTIL_TESTS_PASS" -eq 1 ]; then
+    if [ "$CURRENT_VALIDATION_STATUS" = "passed" ]; then
+      tests_met=1
+    else
+      tests_met=0
+      reasons+=("tests pending")
+    fi
+  fi
+
+  if [ "$UNTIL_CHECKLIST_COMPLETE" -eq 1 ]; then
+    unchecked_count="$(count_unchecked_success_criteria)"
+    if [ "$unchecked_count" -eq 0 ]; then
+      checklist_met=1
+    else
+      checklist_met=0
+      reasons+=("checklist has ${unchecked_count} unchecked item(s)")
+    fi
+  fi
+
+  if [ "$UNTIL_CLEAN_GIT" -eq 1 ]; then
+    if workspace_git_is_clean; then
+      clean_git_met=1
+    else
+      clean_git_met=0
+      reasons+=("git working tree is not clean")
+    fi
+  fi
+
+  STOP_CHECKS_SUMMARY="- until-tests-pass: $([ "$tests_met" -eq 1 ] && echo met || echo pending)
+- until-checklist-complete: $([ "$checklist_met" -eq 1 ] && echo met || echo pending)
+- until-clean-git: $([ "$clean_git_met" -eq 1 ] && echo met || echo pending)"
+
+  if [ "$UNTIL_TESTS_PASS" -eq 0 ] && [ "$UNTIL_CHECKLIST_COMPLETE" -eq 0 ] && [ "$UNTIL_CLEAN_GIT" -eq 0 ]; then
+    return 1
+  fi
+
+  if [ "$tests_met" -eq 1 ] && [ "$checklist_met" -eq 1 ] && [ "$clean_git_met" -eq 1 ]; then
+    return 0
+  fi
+
+  CURRENT_BLOCKER="${reasons[*]}"
+  return 1
+}
+
+maybe_checkpoint_iteration() {
+  local tag_name commit_message dirty=0 commit_output=""
+  LAST_CHECKPOINT_STATUS="disabled"
+  LAST_CHECKPOINT_REASON=""
+  LAST_CHECKPOINT_REF=""
+
+  if [ "$CHECKPOINT_COMMITS" -eq 0 ] && [ "$CHECKPOINT_TAGS" -eq 0 ]; then
+    return 0
+  fi
+
+  if ! workspace_git_is_clean; then
+    dirty=1
+  fi
+
+  if [ "$dirty" -eq 0 ]; then
+    LAST_CHECKPOINT_STATUS="skipped"
+    LAST_CHECKPOINT_REASON="workspace clean"
+    return 0
+  fi
+
+  if [ "$CHECKPOINT_COMMITS" -eq 1 ]; then
+    git -C "$WORKSPACE" add -A >/dev/null 2>&1 || true
+    commit_message="pair-loop: ${SESSION_NAME:-default} iteration ${ITERATION}"
+    if commit_output="$(git -C "$WORKSPACE" commit -m "$commit_message" 2>&1)"; then
+      LAST_CHECKPOINT_STATUS="commit-created"
+      LAST_CHECKPOINT_REF="$(git -C "$WORKSPACE" rev-parse --short HEAD 2>/dev/null || true)"
+    else
+      LAST_CHECKPOINT_STATUS="failed"
+      LAST_CHECKPOINT_REASON="$commit_output"
+      return 0
+    fi
+  fi
+
+  if [ "$CHECKPOINT_TAGS" -eq 1 ]; then
+    tag_name="pair-loop-${SESSION_NAME:-default}-iter-${ITERATION}"
+    if git -C "$WORKSPACE" tag "$tag_name" >/dev/null 2>&1; then
+      if [ -n "$LAST_CHECKPOINT_REF" ]; then
+        LAST_CHECKPOINT_REF="${LAST_CHECKPOINT_REF}, ${tag_name}"
+      else
+        LAST_CHECKPOINT_REF="$tag_name"
+      fi
+      if [ "$LAST_CHECKPOINT_STATUS" = "disabled" ] || [ "$LAST_CHECKPOINT_STATUS" = "skipped" ]; then
+        LAST_CHECKPOINT_STATUS="tag-created"
+      fi
+    else
+      if [ "$LAST_CHECKPOINT_STATUS" = "disabled" ] || [ "$LAST_CHECKPOINT_STATUS" = "skipped" ]; then
+        LAST_CHECKPOINT_STATUS="failed"
+      fi
+      LAST_CHECKPOINT_REASON="failed to create tag ${tag_name}"
+    fi
+  fi
+}
+
+append_iteration_record() {
+  local temp_json agents_json
+  temp_json="$(mktemp)"
+
+  cat > "$temp_json" << EOF
+{
+  "iteration": $ITERATION,
+  "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')",
+  "mode": "$MODE",
+  "validation": {
+    "status": "$CURRENT_VALIDATION_STATUS",
+    "reason": "$(json_escape_inline "$CURRENT_VALIDATION_REASON")"
+  },
+  "checkpoint": {
+    "status": "$LAST_CHECKPOINT_STATUS",
+    "reason": "$(json_escape_inline "$LAST_CHECKPOINT_REASON")",
+    "ref": "$(json_escape_inline "$LAST_CHECKPOINT_REF")"
+  },
+  "stopChecks": {
+    "until-tests-pass": $([ "$UNTIL_TESTS_PASS" -eq 1 ] && [ "$CURRENT_VALIDATION_STATUS" = "passed" ] && echo true || echo false),
+    "until-checklist-complete": $([ "$UNTIL_CHECKLIST_COMPLETE" -eq 1 ] && [ "$(count_unchecked_success_criteria)" -eq 0 ] && echo true || echo false),
+    "until-clean-git": $([ "$UNTIL_CLEAN_GIT" -eq 1 ] && workspace_git_is_clean && echo true || echo false)
+  },
+  "agents": [
+    {
+      "name": "Claude Code",
+      "status": "$CLAUDE_TURN_STATUS",
+      "reason": "$(json_escape_inline "$CLAUDE_TURN_REASON")",
+      "model": "$(display_value "$CLAUDE_MODEL" "default")",
+      "effort": "$(display_value "$CLAUDE_EFFORT" "default")",
+      "durationSeconds": $CLAUDE_DURATION_SECONDS,
+      "exitStatus": $CLAUDE_EXIT_STATUS,
+      "changedFiles": [$(printf '%s\n' "$CLAUDE_CHANGED_FILES" | sed '/^$/d;s/"/\\"/g;s/.*/"&"/' | paste -sd, -)]
+    },
+    {
+      "name": "Codex",
+      "status": "$CODEX_TURN_STATUS",
+      "reason": "$(json_escape_inline "$CODEX_TURN_REASON")",
+      "model": "$(display_value "$CODEX_MODEL" "default")",
+      "effort": "$(display_value "$CODEX_EFFORT" "default")",
+      "durationSeconds": $CODEX_DURATION_SECONDS,
+      "exitStatus": $CODEX_EXIT_STATUS,
+      "changedFiles": [$(printf '%s\n' "$CODEX_CHANGED_FILES" | sed '/^$/d;s/"/\\"/g;s/.*/"&"/' | paste -sd, -)]
+    }
+  ],
+  "nextHandoff": "$(json_escape_inline "$NEXT_HANDOFF_CONTENT")"
+}
+EOF
+
+  cat "$temp_json" >> "$ITERATION_HISTORY_FILE"
+  printf '\n' >> "$ITERATION_HISTORY_FILE"
+  rm -f "$temp_json"
 }
 
 clean_directory_contents() {
@@ -279,24 +779,26 @@ print_status_line() {
 }
 
 read_state_task() {
-  [ -f "$STATE_FILE" ] || return 0
+  local source_file="$STATE_FILE"
+  if [ -n "$SESSION_NAME" ]; then
+    local session_state_file
+    session_state_file="$LOG_DIR/$(sanitize_name "$SESSION_NAME")/state/loop_state.md"
+    if [ -f "$session_state_file" ]; then
+      source_file="$session_state_file"
+    fi
+  fi
+  [ -f "$source_file" ] || return 0
   awk '
     /^## Task$/ { capture = 1; next }
     capture && /^## / { exit }
     capture { print }
-  ' "$STATE_FILE"
+  ' "$source_file"
 }
 
 init_state_file() {
   mkdir -p "$(dirname "$STATE_FILE")"
-  cat > "$STATE_FILE" << EOF
-# Pair Loop State
-
-## Task
-$TASK
-
-## History
-EOF
+  : > "$ITERATION_HISTORY_FILE"
+  render_state_files
 }
 
 prepare_task() {
@@ -313,7 +815,8 @@ prepare_task() {
 
 prepare_workspace_and_logs() {
   echo -e "${CYAN}Preparing workspace and logs...${NC}"
-  mkdir -p "$WORKSPACE" "$LOG_DIR"
+  prepare_session_layout
+  mkdir -p "$WORKSPACE" "$LOG_DIR" "$ACTIVE_LOG_DIR"
 
   if [ "$KEEP_WORKSPACE" -eq 0 ]; then
     echo -e "${YELLOW}Cleaning workspace...${NC}"
@@ -324,25 +827,27 @@ prepare_workspace_and_logs() {
 
   if [ "$KEEP_LOGS" -eq 0 ]; then
     echo -e "${YELLOW}Cleaning logs...${NC}"
-    clean_directory_contents "$LOG_DIR"
+    clean_directory_contents "$ACTIVE_LOG_DIR"
+    RUN_STARTED_AT=""
+    prepare_session_layout
   else
     echo -e "${YELLOW}Preserving log contents.${NC}"
   fi
 
-  mkdir -p "$WORKSPACE" "$LOG_DIR"
+  mkdir -p "$WORKSPACE" "$ACTIVE_LOG_DIR"
 
   if [ ! -d "$WORKSPACE/.git" ]; then
     git -C "$WORKSPACE" init -q
   fi
+  ensure_workspace_git_excludes
 
-  if [ ! -f "$STATE_FILE" ]; then
+  if [ ! -f "$STATE_FILE" ] || [ ! -f "$STATE_JSON_FILE" ]; then
     init_state_file
   elif [ -n "$EXISTING_TASK" ] && [ "$EXISTING_TASK" != "$TASK" ]; then
-    cat >> "$STATE_FILE" << EOF
-
-### Run Restart ($(date '+%Y-%m-%d %H:%M:%S'))
-- Task updated for this run: $TASK
-EOF
+    CURRENT_BLOCKER="Task updated for this run."
+    render_state_files
+  else
+    render_state_files
   fi
 }
 
@@ -351,10 +856,10 @@ detect_last_iteration() {
   local file num
 
   for file in \
-    "$LOG_DIR"/claude_iter*.log \
-    "$LOG_DIR"/codex_iter*.log \
-    "$LOG_DIR"/claude_handoff_iter*.md \
-    "$LOG_DIR"/codex_handoff_iter*.md; do
+    "$ACTIVE_LOG_DIR"/claude_iter*.log \
+    "$ACTIVE_LOG_DIR"/codex_iter*.log \
+    "$ACTIVE_LOG_DIR"/claude_handoff_iter*.md \
+    "$ACTIVE_LOG_DIR"/codex_handoff_iter*.md; do
     [ -e "$file" ] || continue
     num="${file##*iter}"
     num="${num%.*}"
@@ -474,15 +979,32 @@ write_turn_handoff() {
   local reason="$4"
   local before_snapshot="$5"
   local after_snapshot="$6"
-  local git_status
+  local git_status model effort duration exit_status
 
   git_status="$(git -C "$WORKSPACE" status --short 2>/dev/null || true)"
+  if [ "$agent_name" = "Claude Code" ]; then
+    model="$(display_value "$CLAUDE_MODEL" "default")"
+    effort="$(display_value "$CLAUDE_EFFORT" "default")"
+    duration="$CLAUDE_DURATION_SECONDS"
+    exit_status="$CLAUDE_EXIT_STATUS"
+  else
+    model="$(display_value "$CODEX_MODEL" "default")"
+    effort="$(display_value "$CODEX_EFFORT" "default")"
+    duration="$CODEX_DURATION_SECONDS"
+    exit_status="$CODEX_EXIT_STATUS"
+  fi
 
   {
     echo "# Handoff Summary"
     echo
     echo "- Agent: $agent_name"
     echo "- Iteration: $ITERATION"
+    echo "- Session: $(display_value "$SESSION_NAME" "default")"
+    echo "- Mode: $MODE"
+    echo "- Model: $model"
+    echo "- Effort: $effort"
+    echo "- Duration seconds: $duration"
+    echo "- Exit status: $exit_status"
     echo "- Status: $turn_status"
     if [ -n "$reason" ]; then
       echo "- Note: $reason"
@@ -525,6 +1047,16 @@ write_skip_log() {
   local reason="$3"
 
   cat > "$log_file" << EOF
+# Turn Metrics
+timestamp: $(date '+%Y-%m-%d %H:%M:%S')
+session: $(display_value "$SESSION_NAME" "default")
+mode: $MODE
+agent: ${agent_name}
+exit_status: skipped
+duration_seconds: 0
+token_cost_info: unavailable
+
+# Raw Output
 [$(date '+%Y-%m-%d %H:%M:%S')] ${agent_name} skipped for iteration ${ITERATION}
 Reason: ${reason}
 EOF
@@ -532,7 +1064,8 @@ EOF
 
 run_claude() {
   local prompt="$1"
-  local log_file="$LOG_DIR/claude_iter${ITERATION}.log"
+  local log_file="$ACTIVE_LOG_DIR/claude_iter${ITERATION}.log"
+  local raw_log start_seconds end_seconds started_at status
   local cmd=()
 
   echo -e "${GREEN}🤖 [Claude Code] Iteration $ITERATION${NC}"
@@ -552,17 +1085,49 @@ run_claude() {
   fi
   cmd+=("$prompt")
 
-  (
+  raw_log="$(mktemp)"
+  started_at="$(date '+%Y-%m-%d %H:%M:%S')"
+  start_seconds="$(date +%s)"
+
+  if (
     cd "$WORKSPACE" &&
     "${cmd[@]}"
-  ) 2>&1 | tee "$log_file"
+  ) > "$raw_log" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+
+  end_seconds="$(date +%s)"
+  CLAUDE_DURATION_SECONDS=$((end_seconds - start_seconds))
+  CLAUDE_EXIT_STATUS="$status"
+
+  {
+    echo "# Turn Metrics"
+    echo "timestamp: $started_at"
+    echo "session: $(display_value "$SESSION_NAME" "default")"
+    echo "mode: $MODE"
+    echo "agent: Claude Code"
+    echo "model: $(display_value "$CLAUDE_MODEL" "default")"
+    echo "effort: $(display_value "$CLAUDE_EFFORT" "default")"
+    echo "exit_status: $CLAUDE_EXIT_STATUS"
+    echo "duration_seconds: $CLAUDE_DURATION_SECONDS"
+    echo "token_cost_info: unavailable"
+    echo
+    echo "# Raw Output"
+    cat "$raw_log"
+  } > "$log_file"
+  cat "$log_file"
+  rm -f "$raw_log"
 
   echo ""
+  return "$status"
 }
 
 run_codex() {
   local prompt="$1"
-  local log_file="$LOG_DIR/codex_iter${ITERATION}.log"
+  local log_file="$ACTIVE_LOG_DIR/codex_iter${ITERATION}.log"
+  local raw_log start_seconds end_seconds started_at status
   local cmd=()
 
   echo -e "${BLUE}🧠 [Codex] Iteration $ITERATION${NC}"
@@ -582,19 +1147,51 @@ run_codex() {
   fi
   cmd+=("$prompt")
 
-  "${cmd[@]}" 2>&1 | tee "$log_file"
+  raw_log="$(mktemp)"
+  started_at="$(date '+%Y-%m-%d %H:%M:%S')"
+  start_seconds="$(date +%s)"
+
+  if "${cmd[@]}" > "$raw_log" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+
+  end_seconds="$(date +%s)"
+  CODEX_DURATION_SECONDS=$((end_seconds - start_seconds))
+  CODEX_EXIT_STATUS="$status"
+
+  {
+    echo "# Turn Metrics"
+    echo "timestamp: $started_at"
+    echo "session: $(display_value "$SESSION_NAME" "default")"
+    echo "mode: $MODE"
+    echo "agent: Codex"
+    echo "model: $(display_value "$CODEX_MODEL" "default")"
+    echo "effort: $(display_value "$CODEX_EFFORT" "default")"
+    echo "exit_status: $CODEX_EXIT_STATUS"
+    echo "duration_seconds: $CODEX_DURATION_SECONDS"
+    echo "token_cost_info: unavailable"
+    echo
+    echo "# Raw Output"
+    cat "$raw_log"
+  } > "$log_file"
+  cat "$log_file"
+  rm -f "$raw_log"
 
   echo ""
+  return "$status"
 }
 
 execute_claude_turn() {
   local incoming_summary="$1"
   local is_first_turn="$2"
-  local files_snapshot tmp_root
+  local files_snapshot tmp_root next_agent next_role
 
   files_snapshot="$(workspace_snapshot)"
   tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/pairloopstandardclaudeXXXXXX")"
   snapshot_workspace "$tmp_root/before"
+  CLAUDE_CHANGED_FILES="none"
 
   if [ "$CLAUDE_AVAILABLE" -eq 1 ]; then
     if [ "$is_first_turn" -eq 1 ]; then
@@ -605,7 +1202,15 @@ TASK: $TASK
 This is iteration $ITERATION. The workspace is currently at: $WORKSPACE
 $CODEX_STATUS_NOTE
 
-Start implementing the task. Write clean, working code. After you're done, leave a brief note in $WORKSPACE/.loop_state.md describing what you did and what the next person (Codex) should focus on improving.
+ROLE FOCUS:
+$CLAUDE_ROLE_FOCUS
+
+Start implementing the task. Write clean, working code.
+
+Use $WORKSPACE/.loop_state.md as structured shared state:
+- Update Success Criteria checkboxes when work is completed
+- Update File Focus, Open Decisions, and Risks when useful
+- Do not rewrite Current Status, Next Handoff, or Iteration Ledger; the loop script regenerates those sections
 
 Current workspace files:
 $files_snapshot"
@@ -621,6 +1226,9 @@ Codex handoff summary:
 $incoming_summary
 ---
 
+ROLE FOCUS:
+$CLAUDE_ROLE_FOCUS
+
 Current workspace files:
 $files_snapshot
 
@@ -628,7 +1236,8 @@ Review what Codex changed. Then improve the code further:
 - Fix any bugs or issues you find
 - Add features, tests, or documentation
 - Refactor for better quality
-- Update .loop_state.md with what you did and what Codex should do next
+- Update Success Criteria, File Focus, Open Decisions, and Risks in .loop_state.md when useful
+- Do not rewrite Current Status, Next Handoff, or Iteration Ledger; the loop script manages those
 
 Be constructive and build on the current state."
     fi
@@ -643,6 +1252,8 @@ Be constructive and build on the current state."
       echo ""
     fi
   else
+    CLAUDE_DURATION_SECONDS=0
+    CLAUDE_EXIT_STATUS=0
     write_skip_log "$CLAUDE_LOG" "Claude Code" "Unavailable at iteration start: $CLAUDE_STATUS_REASON"
     CLAUDE_TURN_STATUS="skipped"
     CLAUDE_TURN_REASON="Unavailable at iteration start: $CLAUDE_STATUS_REASON"
@@ -658,17 +1269,40 @@ Be constructive and build on the current state."
     "$CLAUDE_TURN_REASON" \
     "$tmp_root/before" \
     "$tmp_root/after"
+  CLAUDE_CHANGED_FILES="$(format_changed_files "$tmp_root/before" "$tmp_root/after")"
+  if [ "$CODEX_AVAILABLE" -eq 1 ]; then
+    next_agent="Codex"
+    next_role="$CODEX_ROLE_FOCUS"
+  else
+    next_agent="Any next available agent"
+    next_role="$CODEX_ROLE_FOCUS"
+  fi
+  set_next_handoff_content "$next_agent" "$CLAUDE_HANDOFF" "$CLAUDE_CHANGED_FILES" "$next_role"
+  CURRENT_PHASE="running"
+  CURRENT_OWNER="$next_agent"
+  if [ "$CLAUDE_TURN_STATUS" = "completed" ]; then
+    CURRENT_HEALTH="green"
+    CURRENT_BLOCKER="none recorded"
+  elif [ "$CLAUDE_TURN_STATUS" = "failed" ]; then
+    CURRENT_HEALTH="yellow"
+    CURRENT_BLOCKER="$CLAUDE_TURN_REASON"
+  else
+    CURRENT_HEALTH="yellow"
+    CURRENT_BLOCKER="$CLAUDE_TURN_REASON"
+  fi
+  render_state_files
   rm -rf "$tmp_root"
 }
 
 execute_codex_turn() {
   local incoming_summary="$1"
   local is_first_turn="$2"
-  local files_snapshot tmp_root
+  local files_snapshot tmp_root next_agent next_role
 
   files_snapshot="$(workspace_snapshot)"
   tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/pairloopstandardcodexXXXXXX")"
   snapshot_workspace "$tmp_root/before"
+  CODEX_CHANGED_FILES="none"
 
   if [ "$CODEX_AVAILABLE" -eq 1 ]; then
     if [ "$is_first_turn" -eq 1 ]; then
@@ -679,7 +1313,15 @@ TASK: $TASK
 This is iteration $ITERATION. The workspace is currently at: $WORKSPACE
 $CLAUDE_STATUS_NOTE
 
-Start implementing the task. Write clean, working code. After you're done, leave a brief note in $WORKSPACE/.loop_state.md describing what you did and what the next person (Claude Code) should focus on improving.
+ROLE FOCUS:
+$CODEX_ROLE_FOCUS
+
+Start implementing the task. Write clean, working code.
+
+Use $WORKSPACE/.loop_state.md as structured shared state:
+- Update Success Criteria checkboxes when work is completed
+- Update File Focus, Open Decisions, and Risks when useful
+- Do not rewrite Current Status, Next Handoff, or Iteration Ledger; the loop script regenerates those sections
 
 Current workspace files:
 $files_snapshot"
@@ -695,6 +1337,9 @@ Claude handoff summary:
 $incoming_summary
 ---
 
+ROLE FOCUS:
+$CODEX_ROLE_FOCUS
+
 Current workspace files:
 $files_snapshot
 
@@ -702,7 +1347,8 @@ Review what Claude changed. Then improve the code further:
 - Fix any bugs or issues you find
 - Add features, tests, or documentation
 - Refactor for better quality
-- Update .loop_state.md with what you did and what Claude should do next
+- Update Success Criteria, File Focus, Open Decisions, and Risks in .loop_state.md when useful
+- Do not rewrite Current Status, Next Handoff, or Iteration Ledger; the loop script manages those
 
 Be constructive and build on the current state."
     fi
@@ -717,6 +1363,8 @@ Be constructive and build on the current state."
       echo ""
     fi
   else
+    CODEX_DURATION_SECONDS=0
+    CODEX_EXIT_STATUS=0
     write_skip_log "$CODEX_LOG" "Codex" "Unavailable at iteration start: $CODEX_STATUS_REASON"
     CODEX_TURN_STATUS="skipped"
     CODEX_TURN_REASON="Unavailable at iteration start: $CODEX_STATUS_REASON"
@@ -732,6 +1380,28 @@ Be constructive and build on the current state."
     "$CODEX_TURN_REASON" \
     "$tmp_root/before" \
     "$tmp_root/after"
+  CODEX_CHANGED_FILES="$(format_changed_files "$tmp_root/before" "$tmp_root/after")"
+  if [ "$CLAUDE_AVAILABLE" -eq 1 ]; then
+    next_agent="Claude Code"
+    next_role="$CLAUDE_ROLE_FOCUS"
+  else
+    next_agent="Any next available agent"
+    next_role="$CLAUDE_ROLE_FOCUS"
+  fi
+  set_next_handoff_content "$next_agent" "$CODEX_HANDOFF" "$CODEX_CHANGED_FILES" "$next_role"
+  CURRENT_PHASE="running"
+  CURRENT_OWNER="$next_agent"
+  if [ "$CODEX_TURN_STATUS" = "completed" ]; then
+    CURRENT_HEALTH="green"
+    CURRENT_BLOCKER="none recorded"
+  elif [ "$CODEX_TURN_STATUS" = "failed" ]; then
+    CURRENT_HEALTH="yellow"
+    CURRENT_BLOCKER="$CODEX_TURN_REASON"
+  else
+    CURRENT_HEALTH="yellow"
+    CURRENT_BLOCKER="$CODEX_TURN_REASON"
+  fi
+  render_state_files
   rm -rf "$tmp_root"
 }
 
@@ -828,6 +1498,26 @@ parse_args() {
         CODEX_EFFORT="$2"
         shift 2
         ;;
+      --role-preset)
+        [ "$#" -ge 2 ] || die "--role-preset requires a value"
+        ROLE_PRESET="$2"
+        shift 2
+        ;;
+      --session-name)
+        [ "$#" -ge 2 ] || die "--session-name requires a value"
+        SESSION_NAME="$2"
+        shift 2
+        ;;
+      --validation-command)
+        [ "$#" -ge 2 ] || die "--validation-command requires a value"
+        VALIDATION_COMMAND="$2"
+        shift 2
+        ;;
+      --state-max-ledger-entries)
+        [ "$#" -ge 2 ] || die "--state-max-ledger-entries requires a value"
+        STATE_MAX_LEDGER_ENTRIES="$2"
+        shift 2
+        ;;
       --first-agent)
         [ "$#" -ge 2 ] || die "--first-agent requires a value"
         FIRST_AGENT="$2"
@@ -858,6 +1548,26 @@ parse_args() {
       --non-destructive|--preserve)
         KEEP_LOGS=1
         KEEP_WORKSPACE=1
+        shift
+        ;;
+      --until-tests-pass)
+        UNTIL_TESTS_PASS=1
+        shift
+        ;;
+      --until-checklist-complete)
+        UNTIL_CHECKLIST_COMPLETE=1
+        shift
+        ;;
+      --until-clean-git)
+        UNTIL_CLEAN_GIT=1
+        shift
+        ;;
+      --checkpoint-commits)
+        CHECKPOINT_COMMITS=1
+        shift
+        ;;
+      --checkpoint-tags)
+        CHECKPOINT_TAGS=1
         shift
         ;;
       --fast)
@@ -911,6 +1621,12 @@ parse_args() {
       ;;
   esac
 
+  case "$STATE_MAX_LEDGER_ENTRIES" in
+    ''|*[!0-9]*)
+      die "state max ledger entries must be a non-negative integer"
+      ;;
+  esac
+
   case "$FIRST_AGENT" in
     claude|codex)
       ;;
@@ -921,12 +1637,14 @@ parse_args() {
 
   apply_profile_defaults
   validate_effort_settings
+  apply_role_preset
 }
 
 parse_args "$@"
 WORKSPACE="$(abs_path "$WORKSPACE")"
 LOG_DIR="$(abs_path "$LOG_DIR")"
 STATE_FILE="$WORKSPACE/.loop_state.md"
+STATE_JSON_FILE="$WORKSPACE/.loop_state.json"
 prepare_task
 run_startup_health_checks
 prepare_workspace_and_logs
@@ -941,13 +1659,16 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 echo -e "${YELLOW}Task:${NC} $TASK"
 echo -e "${YELLOW}Workspace:${NC} $WORKSPACE"
-echo -e "${YELLOW}Log dir:${NC} $LOG_DIR"
+echo -e "${YELLOW}Log dir:${NC} $ACTIVE_LOG_DIR"
 echo -e "${YELLOW}Max iterations:${NC} $MAX_ITERATIONS"
 echo -e "${YELLOW}Profile:${NC} $(display_value "$PROFILE" "custom")"
 echo -e "${YELLOW}Claude model:${NC} $(display_value "$CLAUDE_MODEL" "default")"
 echo -e "${YELLOW}Claude effort:${NC} $(display_value "$CLAUDE_EFFORT" "default")"
 echo -e "${YELLOW}Codex model:${NC} $(display_value "$CODEX_MODEL" "default")"
 echo -e "${YELLOW}Codex effort:${NC} $(display_value "$CODEX_EFFORT" "default")"
+echo -e "${YELLOW}Role preset:${NC} $ROLE_PRESET"
+echo -e "${YELLOW}Session:${NC} $(display_value "$SESSION_NAME" "default")"
+echo -e "${YELLOW}Validation command:${NC} $(display_value "$VALIDATION_COMMAND" "auto")"
 echo -e "${YELLOW}First agent:${NC} $FIRST_AGENT"
 echo -e "${YELLOW}Resume mode:${NC} $RESUME"
 echo -e "${YELLOW}Keep workspace:${NC} $KEEP_WORKSPACE"
@@ -1003,17 +1724,17 @@ while [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; do
     CLAUDE_STATUS_NOTE="Claude Code is unavailable for this iteration (${CLAUDE_STATUS_REASON}). Work independently and leave clear notes for the next available turn."
   fi
 
-  CLAUDE_LOG="$LOG_DIR/claude_iter${ITERATION}.log"
-  CODEX_LOG="$LOG_DIR/codex_iter${ITERATION}.log"
-  CLAUDE_HANDOFF="$LOG_DIR/claude_handoff_iter${ITERATION}.md"
-  CODEX_HANDOFF="$LOG_DIR/codex_handoff_iter${ITERATION}.md"
+  CLAUDE_LOG="$ACTIVE_LOG_DIR/claude_iter${ITERATION}.log"
+  CODEX_LOG="$ACTIVE_LOG_DIR/codex_iter${ITERATION}.log"
+  CLAUDE_HANDOFF="$ACTIVE_LOG_DIR/claude_handoff_iter${ITERATION}.md"
+  CODEX_HANDOFF="$ACTIVE_LOG_DIR/codex_handoff_iter${ITERATION}.md"
 
   if [ "$FIRST_AGENT" = "claude" ]; then
     if [ "$ITERATION" -eq "$FIRST_ITERATION_OF_THIS_RUN" ] && [ "$RESUME" -eq 0 ]; then
       FIRST_TURN_SUMMARY="No prior Codex handoff summary is available for this run."
       FIRST_TURN_IS_FRESH=1
     else
-      FIRST_TURN_SUMMARY="$(read_handoff_summary "$LOG_DIR/codex_handoff_iter$((ITERATION - 1)).md" "No prior Codex handoff summary is available.")"
+      FIRST_TURN_SUMMARY="$(read_handoff_summary "$ACTIVE_LOG_DIR/codex_handoff_iter$((ITERATION - 1)).md" "No prior Codex handoff summary is available.")"
       FIRST_TURN_IS_FRESH=0
     fi
   else
@@ -1021,7 +1742,7 @@ while [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; do
       FIRST_TURN_SUMMARY="No prior Claude handoff summary is available for this run."
       FIRST_TURN_IS_FRESH=1
     else
-      FIRST_TURN_SUMMARY="$(read_handoff_summary "$LOG_DIR/claude_handoff_iter$((ITERATION - 1)).md" "No prior Claude handoff summary is available.")"
+      FIRST_TURN_SUMMARY="$(read_handoff_summary "$ACTIVE_LOG_DIR/claude_handoff_iter$((ITERATION - 1)).md" "No prior Claude handoff summary is available.")"
       FIRST_TURN_IS_FRESH=0
     fi
   fi
@@ -1036,12 +1757,33 @@ while [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; do
     execute_claude_turn "$NEXT_TURN_SUMMARY" 0
   fi
 
+  run_iteration_validation
+  if evaluate_stop_conditions; then
+    CURRENT_PHASE="complete"
+    CURRENT_HEALTH="green"
+    CURRENT_BLOCKER="none recorded"
+  else
+    CURRENT_PHASE="running"
+    [ -n "$CURRENT_BLOCKER" ] || CURRENT_BLOCKER="Loop still has open work."
+  fi
+  maybe_checkpoint_iteration
+  append_iteration_record
+  render_state_files
+
   echo -e "${CYAN}━━━ Iteration $ITERATION complete ━━━${NC}"
   echo -e "  Logs: $CLAUDE_LOG"
   echo -e "        $CODEX_LOG"
   echo -e "  Handoff: $CLAUDE_HANDOFF"
   echo -e "           $CODEX_HANDOFF"
+  if [ -n "$VALIDATION_LOG" ]; then
+    echo -e "  Validation: $VALIDATION_LOG"
+  fi
   echo ""
+
+  if [ "$CURRENT_PHASE" = "complete" ]; then
+    echo -e "${GREEN}Stop conditions satisfied after iteration $ITERATION.${NC}"
+    break
+  fi
 
   sleep 2
 done
