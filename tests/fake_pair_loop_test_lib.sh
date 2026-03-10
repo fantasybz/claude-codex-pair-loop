@@ -99,6 +99,8 @@ if printf '%s\n' "$prompt" | grep -q "Reply with exactly: OK"; then
 fi
 
 perform_fake_turn "claude" "$PWD" "$prompt"
+echo "model: claude-runtime-sonnet"
+echo "effort: high"
 echo "OK"
 EOF
   chmod +x "$fake_bin/claude"
@@ -151,6 +153,8 @@ case "${1:-}" in
     done
     [ -n "$prompt" ] || exit 1
     perform_fake_turn "codex" "$workdir" "$prompt"
+    echo "model: codex-runtime-gpt5"
+    echo "reasoning effort: xhigh"
     echo "OK"
     exit 0
     ;;

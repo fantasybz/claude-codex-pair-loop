@@ -258,6 +258,87 @@ EOF
   rm -rf "$tmp_dir"
 }
 
+run_metadata_and_state_case() {
+  local tmp_dir fake_bin workspace log_dir session summary_file state_json
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/pairloop-metadataXXXXXX")"
+  fake_bin="$tmp_dir/bin"
+  workspace="$tmp_dir/workspace"
+  log_dir="$tmp_dir/logs"
+  session="metadata-case"
+  summary_file="$log_dir/$session/run_summary.json"
+  state_json="$workspace/.loop_state.json"
+
+  make_fake_bin "$fake_bin"
+
+  (
+    cd "$ROOT_DIR"
+    PATH="$fake_bin:$PATH" PAIR_LOOP_FAKE_SCENARIO=smoke ./pair_loop.sh \
+      --workspace "$workspace" \
+      --log-dir "$log_dir" \
+      --session-name "$session" \
+      --task "metadata regression" \
+      --max-iterations 1 \
+      --claude-model claude-configured \
+      --claude-effort medium \
+      --codex-model codex-configured \
+      --codex-effort low \
+      --until-checklist-complete \
+      > "$tmp_dir/output.txt" 2>&1
+  )
+
+  grep -q 'configured_model: claude-configured' "$log_dir/$session/claude_iter1.log" || die "expected configured Claude model in turn log"
+  grep -q 'configured_effort: medium' "$log_dir/$session/claude_iter1.log" || die "expected configured Claude effort in turn log"
+  grep -q 'resolved_model: claude-runtime-sonnet' "$log_dir/$session/claude_iter1.log" || die "expected resolved Claude model in turn log"
+  grep -q 'resolved_effort: high' "$log_dir/$session/claude_iter1.log" || die "expected resolved Claude effort in turn log"
+  grep -q 'configured_model: codex-configured' "$log_dir/$session/codex_iter1.log" || die "expected configured Codex model in turn log"
+  grep -q 'configured_effort: low' "$log_dir/$session/codex_iter1.log" || die "expected configured Codex effort in turn log"
+  grep -q 'resolved_model: codex-runtime-gpt5' "$log_dir/$session/codex_iter1.log" || die "expected resolved Codex model in turn log"
+  grep -q 'resolved_effort: xhigh' "$log_dir/$session/codex_iter1.log" || die "expected resolved Codex effort in turn log"
+  grep -q '## State Snapshot' "$log_dir/$session/claude_handoff_iter1.md" || die "expected structured state snapshot in Claude handoff"
+  if grep -q '## State File Tail' "$log_dir/$session/claude_handoff_iter1.md"; then
+    die "Claude handoff should not include raw state tails"
+  fi
+
+  node - "$summary_file" "$state_json" <<'EOF'
+const fs = require("fs");
+const [summaryPath, statePath] = process.argv.slice(2);
+const summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+const claude = summary.lastIteration.agents.find((agent) => agent.name === "Claude Code");
+const codex = summary.lastIteration.agents.find((agent) => agent.name === "Codex");
+if (!claude || !codex) {
+  throw new Error("missing agent metadata in run summary");
+}
+if (claude.configuredModel !== "claude-configured" || claude.resolvedModel !== "claude-runtime-sonnet") {
+  throw new Error(`unexpected Claude metadata: ${JSON.stringify(claude)}`);
+}
+if (codex.configuredEffort !== "low" || codex.resolvedEffort !== "xhigh") {
+  throw new Error(`unexpected Codex metadata: ${JSON.stringify(codex)}`);
+}
+if (!summary.stopConditions.configured.untilChecklistComplete) {
+  throw new Error("expected configured.untilChecklistComplete=true in run summary");
+}
+if (summary.stopConditions.current.untilChecklistComplete !== true) {
+  throw new Error(`expected current.untilChecklistComplete=true in run summary, got ${summary.stopConditions.current.untilChecklistComplete}`);
+}
+if (summary.stopConditions.current.untilTestsPass !== null) {
+  throw new Error(`expected current.untilTestsPass=null in run summary, got ${summary.stopConditions.current.untilTestsPass}`);
+}
+if (!state.stopConditions.configured.untilChecklistComplete) {
+  throw new Error("expected configured.untilChecklistComplete=true in state json");
+}
+if (state.stopConditions.current.untilChecklistComplete !== true) {
+  throw new Error(`expected current.untilChecklistComplete=true in state json, got ${state.stopConditions.current.untilChecklistComplete}`);
+}
+if (state.stopConditions.current.untilCleanGit !== null) {
+  throw new Error(`expected current.untilCleanGit=null in state json, got ${state.stopConditions.current.untilCleanGit}`);
+}
+EOF
+
+  rm -rf "$tmp_dir"
+}
+
 run_mcp_summary_case() {
   local tmp_dir fake_bin workspace log_dir session summary_file
 
@@ -278,11 +359,21 @@ run_mcp_summary_case() {
       --session-name "$session" \
       --task "mcp regression" \
       --max-iterations 1 \
+      --claude-model claude-mcp-configured \
+      --claude-effort low \
+      --codex-model codex-mcp-configured \
+      --codex-effort medium \
       > "$tmp_dir/output.txt" 2>&1
   )
 
   test -f "$log_dir/$session/claude_mcp_iter1.log" || die "missing Claude MCP log"
   test -f "$log_dir/$session/codex_mcp_iter1.log" || die "missing Codex MCP log"
+  grep -q 'resolved_model: claude-runtime-sonnet' "$log_dir/$session/claude_mcp_iter1.log" || die "expected resolved Claude MCP model in turn log"
+  grep -q 'resolved_model: codex-runtime-gpt5' "$log_dir/$session/codex_mcp_iter1.log" || die "expected resolved Codex MCP model in turn log"
+  grep -q '## State Snapshot' "$log_dir/$session/claude_mcp_handoff_iter1.md" || die "expected structured state snapshot in Claude MCP handoff"
+  if grep -q '## State File Tail' "$log_dir/$session/claude_mcp_handoff_iter1.md"; then
+    die "Claude MCP handoff should not include raw state tails"
+  fi
   node - "$summary_file" <<'EOF'
 const fs = require("fs");
 const summary = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
@@ -291,6 +382,10 @@ if (summary.session.mode !== "mcp") {
 }
 if (!summary.healthChecks.mcp.available) {
   throw new Error("expected MCP health check to be available");
+}
+const claude = summary.lastIteration.agents.find((agent) => agent.name === "Claude Code");
+if (!claude || claude.resolvedModel !== "claude-runtime-sonnet") {
+  throw new Error("expected resolved Claude metadata in MCP summary");
 }
 EOF
 
@@ -304,6 +399,7 @@ run_checklist_stop_case
 run_clean_git_stop_case
 run_checkpoint_case
 run_timeout_case
+run_metadata_and_state_case
 run_mcp_summary_case
 
 echo "pair loop integration regression checks passed"

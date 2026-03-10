@@ -92,7 +92,12 @@ CURRENT_BLOCKER="none recorded"
 CURRENT_OWNER="unassigned"
 CURRENT_VALIDATION_STATUS="not-run"
 CURRENT_VALIDATION_REASON="No validation has run yet."
-STOP_CHECKS_SUMMARY="No stop conditions configured."
+STOP_CHECKS_SUMMARY="- until-tests-pass: not-configured
+- until-checklist-complete: not-configured
+- until-clean-git: not-configured"
+STOP_TESTS_PASS_MET=""
+STOP_CHECKLIST_COMPLETE_MET=""
+STOP_CLEAN_GIT_MET=""
 NEXT_HANDOFF_CONTENT="- Waiting for the first completed turn."
 CLAUDE_ROLE_FOCUS=""
 CODEX_ROLE_FOCUS=""
@@ -103,9 +108,13 @@ VALIDATION_LOG=""
 CLAUDE_DURATION_SECONDS=0
 CLAUDE_EXIT_STATUS=0
 CLAUDE_CHANGED_FILES=""
+CLAUDE_RESOLVED_MODEL=""
+CLAUDE_RESOLVED_EFFORT=""
 CODEX_DURATION_SECONDS=0
 CODEX_EXIT_STATUS=0
 CODEX_CHANGED_FILES=""
+CODEX_RESOLVED_MODEL=""
+CODEX_RESOLVED_EFFORT=""
 
 STARTUP_NODE_AVAILABLE=0
 STARTUP_NODE_REASON=""
@@ -333,6 +342,9 @@ render_state_files() {
   CURRENT_VALIDATION_STATUS="$CURRENT_VALIDATION_STATUS" \
   CURRENT_VALIDATION_REASON="$CURRENT_VALIDATION_REASON" \
   STOP_CHECKS_SUMMARY="$STOP_CHECKS_SUMMARY" \
+  STOP_TESTS_PASS_MET="$STOP_TESTS_PASS_MET" \
+  STOP_CHECKLIST_COMPLETE_MET="$STOP_CHECKLIST_COMPLETE_MET" \
+  STOP_CLEAN_GIT_MET="$STOP_CLEAN_GIT_MET" \
   NEXT_HANDOFF_CONTENT="$NEXT_HANDOFF_CONTENT" \
   UNTIL_TESTS_PASS="$UNTIL_TESTS_PASS" \
   UNTIL_CHECKLIST_COMPLETE="$UNTIL_CHECKLIST_COMPLETE" \
@@ -360,8 +372,68 @@ json_escape_inline() {
   printf '%s' "$1" | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+json_string_or_null() {
+  if [ -n "$1" ]; then
+    printf '"%s"' "$(json_escape_inline "$1")"
+  else
+    printf 'null'
+  fi
+}
+
 json_array_from_lines() {
   printf '%s\n' "$1" | sed '/^$/d;/^none$/d;s/\\/\\\\/g;s/"/\\"/g;s/.*/"&"/' | paste -sd, -
+}
+
+effective_value() {
+  local value="$1"
+  local fallback="$2"
+
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+parse_runtime_log_value() {
+  local raw_log="$1"
+  local pattern="$2"
+
+  awk -v pattern="$pattern" '
+    $0 ~ "^[[:space:]]*" pattern ":[[:space:]]*" {
+      value=$0
+      sub(/^[^:]*:[[:space:]]*/, "", value)
+      gsub(/[[:space:]]+$/, "", value)
+      result=value
+    }
+    END {
+      if (result != "") {
+        print result
+      }
+    }
+  ' "$raw_log"
+}
+
+capture_runtime_metadata() {
+  local agent="$1"
+  local raw_log="$2"
+  local configured_model configured_effort resolved_model resolved_effort
+
+  if [ "$agent" = "claude" ]; then
+    configured_model="$(display_value "$CLAUDE_MODEL" "default")"
+    configured_effort="$(display_value "$CLAUDE_EFFORT" "default")"
+    resolved_model="$(parse_runtime_log_value "$raw_log" "[Mm]odel")"
+    resolved_effort="$(parse_runtime_log_value "$raw_log" "([Rr]easoning[[:space:]]+)?[Ee]ffort")"
+    CLAUDE_RESOLVED_MODEL="$(effective_value "$resolved_model" "$configured_model")"
+    CLAUDE_RESOLVED_EFFORT="$(effective_value "$resolved_effort" "$configured_effort")"
+  else
+    configured_model="$(display_value "$CODEX_MODEL" "default")"
+    configured_effort="$(display_value "$CODEX_EFFORT" "default")"
+    resolved_model="$(parse_runtime_log_value "$raw_log" "[Mm]odel")"
+    resolved_effort="$(parse_runtime_log_value "$raw_log" "([Rr]easoning[[:space:]]+)?[Ee]ffort")"
+    CODEX_RESOLVED_MODEL="$(effective_value "$resolved_model" "$configured_model")"
+    CODEX_RESOLVED_EFFORT="$(effective_value "$resolved_effort" "$configured_effort")"
+  fi
 }
 
 changed_files_list() {
@@ -417,6 +489,21 @@ set_next_handoff_content() {
 - Review changed files: $(printf '%s\n' "$changed_files" | join_lines_with_comma)
 - Role focus: $role_focus
 - Handoff file: $handoff_file"
+}
+
+write_handoff_state_snapshot() {
+  echo "## State Snapshot"
+  echo "- Phase: $CURRENT_PHASE"
+  echo "- Health: $CURRENT_HEALTH"
+  echo "- Current owner: $CURRENT_OWNER"
+  echo "- Main blocker: $CURRENT_BLOCKER"
+  echo "- Validation: $CURRENT_VALIDATION_STATUS ($CURRENT_VALIDATION_REASON)"
+  echo
+  echo "## Stop Checks"
+  printf '%s\n' "$STOP_CHECKS_SUMMARY"
+  echo
+  echo "## Next Handoff"
+  printf '%s\n' "$NEXT_HANDOFF_CONTENT"
 }
 
 workspace_git_is_clean() {
@@ -514,12 +601,21 @@ count_unchecked_success_criteria() {
 
 evaluate_stop_conditions() {
   local reasons=() tests_met=1 checklist_met=1 clean_git_met=1 unchecked_count=0
+  local tests_status="not-configured" checklist_status="not-configured" clean_git_status="not-configured"
+
+  STOP_TESTS_PASS_MET=""
+  STOP_CHECKLIST_COMPLETE_MET=""
+  STOP_CLEAN_GIT_MET=""
 
   if [ "$UNTIL_TESTS_PASS" -eq 1 ]; then
     if [ "$CURRENT_VALIDATION_STATUS" = "passed" ]; then
       tests_met=1
+      STOP_TESTS_PASS_MET="1"
+      tests_status="met"
     else
       tests_met=0
+      STOP_TESTS_PASS_MET="0"
+      tests_status="pending"
       reasons+=("tests pending")
     fi
   fi
@@ -528,8 +624,12 @@ evaluate_stop_conditions() {
     unchecked_count="$(count_unchecked_success_criteria)"
     if [ "$unchecked_count" -eq 0 ]; then
       checklist_met=1
+      STOP_CHECKLIST_COMPLETE_MET="1"
+      checklist_status="met"
     else
       checklist_met=0
+      STOP_CHECKLIST_COMPLETE_MET="0"
+      checklist_status="pending"
       reasons+=("checklist has ${unchecked_count} unchecked item(s)")
     fi
   fi
@@ -537,15 +637,19 @@ evaluate_stop_conditions() {
   if [ "$UNTIL_CLEAN_GIT" -eq 1 ]; then
     if workspace_git_is_clean; then
       clean_git_met=1
+      STOP_CLEAN_GIT_MET="1"
+      clean_git_status="met"
     else
       clean_git_met=0
+      STOP_CLEAN_GIT_MET="0"
+      clean_git_status="pending"
       reasons+=("git working tree is not clean")
     fi
   fi
 
-  STOP_CHECKS_SUMMARY="- until-tests-pass: $([ "$tests_met" -eq 1 ] && echo met || echo pending)
-- until-checklist-complete: $([ "$checklist_met" -eq 1 ] && echo met || echo pending)
-- until-clean-git: $([ "$clean_git_met" -eq 1 ] && echo met || echo pending)"
+  STOP_CHECKS_SUMMARY="- until-tests-pass: $tests_status
+- until-checklist-complete: $checklist_status
+- until-clean-git: $clean_git_status"
 
   if [ "$UNTIL_TESTS_PASS" -eq 0 ] && [ "$UNTIL_CHECKLIST_COMPLETE" -eq 0 ] && [ "$UNTIL_CLEAN_GIT" -eq 0 ]; then
     return 1
@@ -641,8 +745,12 @@ append_iteration_record() {
       "name": "Claude Code",
       "status": "$CLAUDE_TURN_STATUS",
       "reason": "$(json_escape_inline "$CLAUDE_TURN_REASON")",
-      "model": "$(display_value "$CLAUDE_MODEL" "default")",
-      "effort": "$(display_value "$CLAUDE_EFFORT" "default")",
+      "model": "$(json_escape_inline "$(effective_value "$CLAUDE_RESOLVED_MODEL" "$(display_value "$CLAUDE_MODEL" "default")")")",
+      "effort": "$(json_escape_inline "$(effective_value "$CLAUDE_RESOLVED_EFFORT" "$(display_value "$CLAUDE_EFFORT" "default")")")",
+      "configuredModel": "$(display_value "$CLAUDE_MODEL" "default")",
+      "configuredEffort": "$(display_value "$CLAUDE_EFFORT" "default")",
+      "resolvedModel": $(json_string_or_null "$CLAUDE_RESOLVED_MODEL"),
+      "resolvedEffort": $(json_string_or_null "$CLAUDE_RESOLVED_EFFORT"),
       "durationSeconds": $CLAUDE_DURATION_SECONDS,
       "exitStatus": $CLAUDE_EXIT_STATUS,
       "changedFiles": [$(json_array_from_lines "$CLAUDE_CHANGED_FILES")]
@@ -651,8 +759,12 @@ append_iteration_record() {
       "name": "Codex",
       "status": "$CODEX_TURN_STATUS",
       "reason": "$(json_escape_inline "$CODEX_TURN_REASON")",
-      "model": "$(display_value "$CODEX_MODEL" "default")",
-      "effort": "$(display_value "$CODEX_EFFORT" "default")",
+      "model": "$(json_escape_inline "$(effective_value "$CODEX_RESOLVED_MODEL" "$(display_value "$CODEX_MODEL" "default")")")",
+      "effort": "$(json_escape_inline "$(effective_value "$CODEX_RESOLVED_EFFORT" "$(display_value "$CODEX_EFFORT" "default")")")",
+      "configuredModel": "$(display_value "$CODEX_MODEL" "default")",
+      "configuredEffort": "$(display_value "$CODEX_EFFORT" "default")",
+      "resolvedModel": $(json_string_or_null "$CODEX_RESOLVED_MODEL"),
+      "resolvedEffort": $(json_string_or_null "$CODEX_RESOLVED_EFFORT"),
       "durationSeconds": $CODEX_DURATION_SECONDS,
       "exitStatus": $CODEX_EXIT_STATUS,
       "changedFiles": [$(json_array_from_lines "$CODEX_CHANGED_FILES")]
@@ -718,6 +830,9 @@ write_run_summary() {
   LAST_CHECKPOINT_REASON="$LAST_CHECKPOINT_REASON" \
   LAST_CHECKPOINT_REF="$LAST_CHECKPOINT_REF" \
   STOP_CHECKS_SUMMARY="$STOP_CHECKS_SUMMARY" \
+  STOP_TESTS_PASS_MET="$STOP_TESTS_PASS_MET" \
+  STOP_CHECKLIST_COMPLETE_MET="$STOP_CHECKLIST_COMPLETE_MET" \
+  STOP_CLEAN_GIT_MET="$STOP_CLEAN_GIT_MET" \
   UNTIL_TESTS_PASS="$UNTIL_TESTS_PASS" \
   UNTIL_CHECKLIST_COMPLETE="$UNTIL_CHECKLIST_COMPLETE" \
   UNTIL_CLEAN_GIT="$UNTIL_CLEAN_GIT" \
@@ -726,24 +841,46 @@ write_run_summary() {
   CLAUDE_DURATION_SECONDS="$CLAUDE_DURATION_SECONDS" \
   CLAUDE_EXIT_STATUS="$CLAUDE_EXIT_STATUS" \
   CLAUDE_CHANGED_FILES="$CLAUDE_CHANGED_FILES" \
+  CLAUDE_RESOLVED_MODEL="$CLAUDE_RESOLVED_MODEL" \
+  CLAUDE_RESOLVED_EFFORT="$CLAUDE_RESOLVED_EFFORT" \
   CODEX_TURN_STATUS="$CODEX_TURN_STATUS" \
   CODEX_TURN_REASON="$CODEX_TURN_REASON" \
   CODEX_DURATION_SECONDS="$CODEX_DURATION_SECONDS" \
   CODEX_EXIT_STATUS="$CODEX_EXIT_STATUS" \
   CODEX_CHANGED_FILES="$CODEX_CHANGED_FILES" \
+  CODEX_RESOLVED_MODEL="$CODEX_RESOLVED_MODEL" \
+  CODEX_RESOLVED_EFFORT="$CODEX_RESOLVED_EFFORT" \
   FINAL_STOP_REASON="$FINAL_STOP_REASON" \
     node <<'EOF'
 const fs = require("fs");
 
 const env = process.env;
 const bool = (value) => value === "1";
+const boolOrNull = (value) => {
+  if (value === "1") {
+    return true;
+  }
+  if (value === "0") {
+    return false;
+  }
+  return null;
+};
 const num = (value) => Number.parseInt(value || "0", 10);
 const list = (value) => (value || "")
   .split("\n")
   .map((item) => item.trim())
   .filter((item) => item.length > 0 && item !== "none");
+const textOrNull = (value) => value || null;
 
 const iterationsCompleted = num(env.ITERATION);
+const claudeConfiguredModel = env.CLAUDE_MODEL || "default";
+const claudeConfiguredEffort = env.CLAUDE_EFFORT || "default";
+const claudeResolvedModel = textOrNull(env.CLAUDE_RESOLVED_MODEL);
+const claudeResolvedEffort = textOrNull(env.CLAUDE_RESOLVED_EFFORT);
+const codexConfiguredModel = env.CODEX_MODEL || "default";
+const codexConfiguredEffort = env.CODEX_EFFORT || "default";
+const codexResolvedModel = textOrNull(env.CODEX_RESOLVED_MODEL);
+const codexResolvedEffort = textOrNull(env.CODEX_RESOLVED_EFFORT);
 const lastIteration = iterationsCompleted > 0 ? {
   iteration: iterationsCompleted,
   agents: [
@@ -751,8 +888,12 @@ const lastIteration = iterationsCompleted > 0 ? {
       name: "Claude Code",
       status: env.CLAUDE_TURN_STATUS,
       reason: env.CLAUDE_TURN_REASON,
-      model: env.CLAUDE_MODEL || "default",
-      effort: env.CLAUDE_EFFORT || "default",
+      model: claudeResolvedModel || claudeConfiguredModel,
+      effort: claudeResolvedEffort || claudeConfiguredEffort,
+      configuredModel: claudeConfiguredModel,
+      configuredEffort: claudeConfiguredEffort,
+      resolvedModel: claudeResolvedModel,
+      resolvedEffort: claudeResolvedEffort,
       durationSeconds: num(env.CLAUDE_DURATION_SECONDS),
       exitStatus: num(env.CLAUDE_EXIT_STATUS),
       changedFiles: list(env.CLAUDE_CHANGED_FILES),
@@ -761,8 +902,12 @@ const lastIteration = iterationsCompleted > 0 ? {
       name: "Codex",
       status: env.CODEX_TURN_STATUS,
       reason: env.CODEX_TURN_REASON,
-      model: env.CODEX_MODEL || "default",
-      effort: env.CODEX_EFFORT || "default",
+      model: codexResolvedModel || codexConfiguredModel,
+      effort: codexResolvedEffort || codexConfiguredEffort,
+      configuredModel: codexConfiguredModel,
+      configuredEffort: codexConfiguredEffort,
+      resolvedModel: codexResolvedModel,
+      resolvedEffort: codexResolvedEffort,
       durationSeconds: num(env.CODEX_DURATION_SECONDS),
       exitStatus: num(env.CODEX_EXIT_STATUS),
       changedFiles: list(env.CODEX_CHANGED_FILES),
@@ -778,6 +923,11 @@ const lastIteration = iterationsCompleted > 0 ? {
     status: env.LAST_CHECKPOINT_STATUS,
     reason: env.LAST_CHECKPOINT_REASON,
     ref: env.LAST_CHECKPOINT_REF,
+  },
+  stopChecks: {
+    untilTestsPass: boolOrNull(env.STOP_TESTS_PASS_MET),
+    untilChecklistComplete: boolOrNull(env.STOP_CHECKLIST_COMPLETE_MET),
+    untilCleanGit: boolOrNull(env.STOP_CLEAN_GIT_MET),
   },
 } : null;
 
@@ -828,9 +978,16 @@ const summary = {
     ref: env.LAST_CHECKPOINT_REF,
   },
   stopConditions: {
-    untilTestsPassConfigured: bool(env.UNTIL_TESTS_PASS),
-    untilChecklistCompleteConfigured: bool(env.UNTIL_CHECKLIST_COMPLETE),
-    untilCleanGitConfigured: bool(env.UNTIL_CLEAN_GIT),
+    configured: {
+      untilTestsPass: bool(env.UNTIL_TESTS_PASS),
+      untilChecklistComplete: bool(env.UNTIL_CHECKLIST_COMPLETE),
+      untilCleanGit: bool(env.UNTIL_CLEAN_GIT),
+    },
+    current: {
+      untilTestsPass: boolOrNull(env.STOP_TESTS_PASS_MET),
+      untilChecklistComplete: boolOrNull(env.STOP_CHECKLIST_COMPLETE_MET),
+      untilCleanGit: boolOrNull(env.STOP_CLEAN_GIT_MET),
+    },
     summary: env.STOP_CHECKS_SUMMARY,
   },
   healthChecks: {
@@ -1276,17 +1433,21 @@ write_turn_handoff() {
   local reason="$4"
   local before_snapshot="$5"
   local after_snapshot="$6"
-  local git_status model effort duration exit_status
+  local git_status configured_model configured_effort resolved_model resolved_effort duration exit_status
 
   git_status="$(git -C "$WORKSPACE" status --short 2>/dev/null || true)"
   if [ "$agent_name" = "Claude Code" ]; then
-    model="$(display_value "$CLAUDE_MODEL" "default")"
-    effort="$(display_value "$CLAUDE_EFFORT" "default")"
+    configured_model="$(display_value "$CLAUDE_MODEL" "default")"
+    configured_effort="$(display_value "$CLAUDE_EFFORT" "default")"
+    resolved_model="$(effective_value "$CLAUDE_RESOLVED_MODEL" "$configured_model")"
+    resolved_effort="$(effective_value "$CLAUDE_RESOLVED_EFFORT" "$configured_effort")"
     duration="$CLAUDE_DURATION_SECONDS"
     exit_status="$CLAUDE_EXIT_STATUS"
   else
-    model="$(display_value "$CODEX_MODEL" "default")"
-    effort="$(display_value "$CODEX_EFFORT" "default")"
+    configured_model="$(display_value "$CODEX_MODEL" "default")"
+    configured_effort="$(display_value "$CODEX_EFFORT" "default")"
+    resolved_model="$(effective_value "$CODEX_RESOLVED_MODEL" "$configured_model")"
+    resolved_effort="$(effective_value "$CODEX_RESOLVED_EFFORT" "$configured_effort")"
     duration="$CODEX_DURATION_SECONDS"
     exit_status="$CODEX_EXIT_STATUS"
   fi
@@ -1298,8 +1459,10 @@ write_turn_handoff() {
     echo "- Iteration: $ITERATION"
     echo "- Session: $(display_value "$SESSION_NAME" "default")"
     echo "- Mode: $MODE"
-    echo "- Model: $model"
-    echo "- Effort: $effort"
+    echo "- Configured model: $configured_model"
+    echo "- Configured effort: $configured_effort"
+    echo "- Resolved model: $resolved_model"
+    echo "- Resolved effort: $resolved_effort"
     echo "- Duration seconds: $duration"
     echo "- Exit status: $exit_status"
     echo "- Status: $turn_status"
@@ -1320,10 +1483,7 @@ write_turn_handoff() {
     echo "## Workspace Files"
     workspace_snapshot
     echo
-    if [ -f "$STATE_FILE" ]; then
-      echo "## State File Tail"
-      tail -40 "$STATE_FILE"
-    fi
+    write_handoff_state_snapshot
   } > "$summary_file"
 }
 
@@ -1342,6 +1502,15 @@ write_skip_log() {
   local log_file="$1"
   local agent_name="$2"
   local reason="$3"
+  local configured_model configured_effort
+
+  if [ "$agent_name" = "Claude Code" ]; then
+    configured_model="$(display_value "$CLAUDE_MODEL" "default")"
+    configured_effort="$(display_value "$CLAUDE_EFFORT" "default")"
+  else
+    configured_model="$(display_value "$CODEX_MODEL" "default")"
+    configured_effort="$(display_value "$CODEX_EFFORT" "default")"
+  fi
 
   cat > "$log_file" << EOF
 # Turn Metrics
@@ -1349,6 +1518,10 @@ timestamp: $(date '+%Y-%m-%d %H:%M:%S')
 session: $(display_value "$SESSION_NAME" "default")
 mode: $MODE
 agent: ${agent_name}
+configured_model: ${configured_model}
+configured_effort: ${configured_effort}
+resolved_model: unavailable
+resolved_effort: unavailable
 exit_status: skipped
 duration_seconds: 0
 token_cost_info: unavailable
@@ -1387,6 +1560,8 @@ run_claude() {
   raw_log="$(mktemp)"
   started_at="$(date '+%Y-%m-%d %H:%M:%S')"
   start_seconds="$(date +%s)"
+  CLAUDE_RESOLVED_MODEL=""
+  CLAUDE_RESOLVED_EFFORT=""
 
   if [ "$TURN_TIMEOUT" -gt 0 ]; then
     if (
@@ -1411,6 +1586,7 @@ run_claude() {
   end_seconds="$(date +%s)"
   CLAUDE_DURATION_SECONDS=$((end_seconds - start_seconds))
   CLAUDE_EXIT_STATUS="$status"
+  capture_runtime_metadata "claude" "$raw_log"
 
   {
     echo "# Turn Metrics"
@@ -1418,8 +1594,10 @@ run_claude() {
     echo "session: $(display_value "$SESSION_NAME" "default")"
     echo "mode: $MODE"
     echo "agent: Claude Code"
-    echo "model: $(display_value "$CLAUDE_MODEL" "default")"
-    echo "effort: $(display_value "$CLAUDE_EFFORT" "default")"
+    echo "configured_model: $(display_value "$CLAUDE_MODEL" "default")"
+    echo "configured_effort: $(display_value "$CLAUDE_EFFORT" "default")"
+    echo "resolved_model: $(effective_value "$CLAUDE_RESOLVED_MODEL" "$(display_value "$CLAUDE_MODEL" "default")")"
+    echo "resolved_effort: $(effective_value "$CLAUDE_RESOLVED_EFFORT" "$(display_value "$CLAUDE_EFFORT" "default")")"
     echo "exit_status: $CLAUDE_EXIT_STATUS"
     echo "duration_seconds: $CLAUDE_DURATION_SECONDS"
     echo "token_cost_info: unavailable"
@@ -1460,6 +1638,8 @@ run_codex() {
   raw_log="$(mktemp)"
   started_at="$(date '+%Y-%m-%d %H:%M:%S')"
   start_seconds="$(date +%s)"
+  CODEX_RESOLVED_MODEL=""
+  CODEX_RESOLVED_EFFORT=""
 
   if [ "$TURN_TIMEOUT" -gt 0 ]; then
     if run_with_timeout "$TURN_TIMEOUT" "${cmd[@]}" > "$raw_log" 2>&1; then
@@ -1478,6 +1658,7 @@ run_codex() {
   end_seconds="$(date +%s)"
   CODEX_DURATION_SECONDS=$((end_seconds - start_seconds))
   CODEX_EXIT_STATUS="$status"
+  capture_runtime_metadata "codex" "$raw_log"
 
   {
     echo "# Turn Metrics"
@@ -1485,8 +1666,10 @@ run_codex() {
     echo "session: $(display_value "$SESSION_NAME" "default")"
     echo "mode: $MODE"
     echo "agent: Codex"
-    echo "model: $(display_value "$CODEX_MODEL" "default")"
-    echo "effort: $(display_value "$CODEX_EFFORT" "default")"
+    echo "configured_model: $(display_value "$CODEX_MODEL" "default")"
+    echo "configured_effort: $(display_value "$CODEX_EFFORT" "default")"
+    echo "resolved_model: $(effective_value "$CODEX_RESOLVED_MODEL" "$(display_value "$CODEX_MODEL" "default")")"
+    echo "resolved_effort: $(effective_value "$CODEX_RESOLVED_EFFORT" "$(display_value "$CODEX_EFFORT" "default")")"
     echo "exit_status: $CODEX_EXIT_STATUS"
     echo "duration_seconds: $CODEX_DURATION_SECONDS"
     echo "token_cost_info: unavailable"
@@ -1584,6 +1767,8 @@ Build incrementally. Do not rewrite everything."
   else
     CLAUDE_DURATION_SECONDS=0
     CLAUDE_EXIT_STATUS=0
+    CLAUDE_RESOLVED_MODEL=""
+    CLAUDE_RESOLVED_EFFORT=""
     write_skip_log "$CLAUDE_LOG" "Claude Code" "Unavailable at iteration start: $CLAUDE_STATUS_REASON"
     CLAUDE_TURN_STATUS="skipped"
     CLAUDE_TURN_REASON="Unavailable at iteration start: $CLAUDE_STATUS_REASON"
@@ -1592,13 +1777,6 @@ Build incrementally. Do not rewrite everything."
   fi
 
   snapshot_workspace "$tmp_root/after"
-  write_turn_handoff \
-    "Claude Code" \
-    "$CLAUDE_HANDOFF" \
-    "$CLAUDE_TURN_STATUS" \
-    "$CLAUDE_TURN_REASON" \
-    "$tmp_root/before" \
-    "$tmp_root/after"
   CLAUDE_CHANGED_FILES="$(format_changed_files "$tmp_root/before" "$tmp_root/after")"
   if [ "$CODEX_AVAILABLE" -eq 1 ]; then
     next_agent="Codex"
@@ -1617,6 +1795,13 @@ Build incrementally. Do not rewrite everything."
     CURRENT_HEALTH="yellow"
     CURRENT_BLOCKER="$CLAUDE_TURN_REASON"
   fi
+  write_turn_handoff \
+    "Claude Code" \
+    "$CLAUDE_HANDOFF" \
+    "$CLAUDE_TURN_STATUS" \
+    "$CLAUDE_TURN_REASON" \
+    "$tmp_root/before" \
+    "$tmp_root/after"
   render_state_files
   rm -rf "$tmp_root"
 }
@@ -1704,6 +1889,8 @@ Build incrementally. Do not rewrite everything."
   else
     CODEX_DURATION_SECONDS=0
     CODEX_EXIT_STATUS=0
+    CODEX_RESOLVED_MODEL=""
+    CODEX_RESOLVED_EFFORT=""
     write_skip_log "$CODEX_LOG" "Codex" "Unavailable at iteration start: $CODEX_STATUS_REASON"
     CODEX_TURN_STATUS="skipped"
     CODEX_TURN_REASON="Unavailable at iteration start: $CODEX_STATUS_REASON"
@@ -1712,13 +1899,6 @@ Build incrementally. Do not rewrite everything."
   fi
 
   snapshot_workspace "$tmp_root/after"
-  write_turn_handoff \
-    "Codex" \
-    "$CODEX_HANDOFF" \
-    "$CODEX_TURN_STATUS" \
-    "$CODEX_TURN_REASON" \
-    "$tmp_root/before" \
-    "$tmp_root/after"
   CODEX_CHANGED_FILES="$(format_changed_files "$tmp_root/before" "$tmp_root/after")"
   if [ "$CLAUDE_AVAILABLE" -eq 1 ]; then
     next_agent="Claude Code"
@@ -1737,6 +1917,13 @@ Build incrementally. Do not rewrite everything."
     CURRENT_HEALTH="yellow"
     CURRENT_BLOCKER="$CODEX_TURN_REASON"
   fi
+  write_turn_handoff \
+    "Codex" \
+    "$CODEX_HANDOFF" \
+    "$CODEX_TURN_STATUS" \
+    "$CODEX_TURN_REASON" \
+    "$tmp_root/before" \
+    "$tmp_root/after"
   render_state_files
   rm -rf "$tmp_root"
 }

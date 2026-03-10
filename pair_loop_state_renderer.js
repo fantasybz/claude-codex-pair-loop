@@ -39,9 +39,14 @@ function renderAgent(agent) {
   const changed = Array.isArray(agent.changedFiles) && agent.changedFiles.length > 0
     ? agent.changedFiles.join(", ")
     : "none";
+  const resolvedModel = agent.resolvedModel || agent.model || "default";
+  const resolvedEffort = agent.resolvedEffort || agent.effort || "default";
+  const configuredModel = agent.configuredModel || agent.model || resolvedModel;
+  const configuredEffort = agent.configuredEffort || agent.effort || resolvedEffort;
   return [
     `- ${agent.name}: ${agent.status}`,
-    `  model=${agent.model || "default"}, effort=${agent.effort || "default"}, duration=${agent.durationSeconds}s, exit=${agent.exitStatus}`,
+    `  resolved model=${resolvedModel}, resolved effort=${resolvedEffort}, duration=${agent.durationSeconds}s, exit=${agent.exitStatus}`,
+    `  configured model=${configuredModel}, configured effort=${configuredEffort}`,
     `  changed files: ${changed}`,
     agent.reason ? `  note: ${agent.reason}` : "",
   ].filter(Boolean).join("\n");
@@ -108,6 +113,15 @@ function main() {
   const maxEntries = Number(process.env.STATE_MAX_LEDGER_ENTRIES || "12");
   const archivedEntries = entries.slice(0, Math.max(entries.length - maxEntries, 0));
   const recentEntries = entries.slice(-maxEntries);
+  const boolOrNull = (value) => {
+    if (value === "1") {
+      return true;
+    }
+    if (value === "0") {
+      return false;
+    }
+    return null;
+  };
 
   const successCriteria = readFileSafe(successCriteriaFile) || [
     "- [ ] Core implementation works",
@@ -143,10 +157,21 @@ function main() {
     nextHandoff: process.env.NEXT_HANDOFF_CONTENT || "- Waiting for the next completed turn.",
     risks,
     stopConditions: {
-      untilTestsPass: process.env.UNTIL_TESTS_PASS === "1",
-      untilChecklistComplete: process.env.UNTIL_CHECKLIST_COMPLETE === "1",
-      untilCleanGit: process.env.UNTIL_CLEAN_GIT === "1",
-      summary: process.env.STOP_CHECKS_SUMMARY || "No stop conditions configured.",
+      configured: {
+        untilTestsPass: process.env.UNTIL_TESTS_PASS === "1",
+        untilChecklistComplete: process.env.UNTIL_CHECKLIST_COMPLETE === "1",
+        untilCleanGit: process.env.UNTIL_CLEAN_GIT === "1",
+      },
+      current: {
+        untilTestsPass: boolOrNull(process.env.STOP_TESTS_PASS_MET),
+        untilChecklistComplete: boolOrNull(process.env.STOP_CHECKLIST_COMPLETE_MET),
+        untilCleanGit: boolOrNull(process.env.STOP_CLEAN_GIT_MET),
+      },
+      summary: process.env.STOP_CHECKS_SUMMARY || [
+        "- until-tests-pass: not-configured",
+        "- until-checklist-complete: not-configured",
+        "- until-clean-git: not-configured",
+      ].join("\n"),
     },
     validationCommand: process.env.VALIDATION_COMMAND_USED || "",
     iterations: entries,
