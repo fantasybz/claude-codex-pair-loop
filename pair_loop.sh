@@ -277,6 +277,8 @@ section_to_temp_file() {
 
 sync_state_session_mirrors() {
   [ -d "$SESSION_STATE_DIR" ] || return 0
+  [ -f "$STATE_FILE" ] || return 0
+  [ -f "$STATE_JSON_FILE" ] || return 0
   cp "$STATE_FILE" "$SESSION_STATE_DIR/loop_state.md"
   cp "$STATE_JSON_FILE" "$SESSION_STATE_DIR/loop_state.json"
 }
@@ -1610,16 +1612,26 @@ parse_args() {
     esac
   done
 
-  if [ "${#positional[@]}" -gt 2 ]; then
+  expected_positionals=0
+  if [ "$TASK_FROM_FLAG" -eq 0 ]; then
+    expected_positionals=$((expected_positionals + 1))
+  fi
+  if [ "$MAX_ITERATIONS_FROM_FLAG" -eq 0 ]; then
+    expected_positionals=$((expected_positionals + 1))
+  fi
+
+  if [ "${#positional[@]}" -gt "$expected_positionals" ]; then
     die "Too many positional arguments"
   fi
 
-  if [ "${#positional[@]}" -ge 1 ] && [ "$TASK_FROM_FLAG" -eq 0 ]; then
-    TASK="${positional[0]}"
+  positional_index=0
+  if [ "$TASK_FROM_FLAG" -eq 0 ] && [ "${#positional[@]}" -gt "$positional_index" ]; then
+    TASK="${positional[$positional_index]}"
+    positional_index=$((positional_index + 1))
   fi
 
-  if [ "${#positional[@]}" -ge 2 ] && [ "$MAX_ITERATIONS_FROM_FLAG" -eq 0 ]; then
-    MAX_ITERATIONS="${positional[1]}"
+  if [ "$MAX_ITERATIONS_FROM_FLAG" -eq 0 ] && [ "${#positional[@]}" -gt "$positional_index" ]; then
+    MAX_ITERATIONS="${positional[$positional_index]}"
   fi
 
   case "$MAX_ITERATIONS" in
