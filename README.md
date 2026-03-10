@@ -111,6 +111,12 @@ Resume an existing MCP run:
 ./pair_loop_mcp.sh --resume --workspace ./workspace --log-dir ./logs
 ```
 
+Run with Codex starting first:
+
+```bash
+./pair_loop.sh --codex-first --task "Improve an existing CLI tool"
+```
+
 Arguments:
 
 - First argument: task description passed to both agents.
@@ -126,6 +132,9 @@ Supported flags:
 - `--log-dir PATH`: use a custom log directory
 - `--task TEXT`: pass the task as a flag instead of a positional argument
 - `--max-iterations N`: pass the iteration count as a flag
+- `--first-agent claude|codex`: choose which agent starts each iteration
+- `--claude-first`: alias for `--first-agent claude`
+- `--codex-first`: alias for `--first-agent codex`
 - `--resume`: continue from the current workspace and existing logs without cleaning them
 - `--keep-logs`: preserve existing log files on startup
 - `--keep-workspace`: preserve the existing workspace on startup
@@ -153,10 +162,10 @@ The terminal output also prints:
 
 `pair_loop.sh` is the more straightforward version.
 
-- Claude always goes first.
+- Claude starts first by default, but you can switch to Codex-first with `--first-agent codex` or `--codex-first`.
 - By default it starts from a fresh workspace, but `--resume` and `--non-destructive` preserve existing state.
-- Claude receives the previous Codex handoff summary instead of a raw log tail.
-- Codex then receives the current Claude handoff summary.
+- The first agent receives the previous handoff summary from the other agent instead of a raw log tail.
+- The second agent then receives the current handoff summary from the first agent.
 - Both agents are instructed to improve the same codebase incrementally and update `.loop_state.md`.
 
 This mode is easier to reason about because all collaboration is explicit in the alternating turns.
@@ -165,6 +174,7 @@ This mode is easier to reason about because all collaboration is explicit in the
 
 `pair_loop_mcp.sh` keeps the same outer loop, but changes what happens inside each turn.
 
+- Claude starts first by default, but you can switch to Codex-first with `--first-agent codex` or `--codex-first`.
 - Claude is expected to work directly in `workspace/` and then delegate additional work to Codex through an MCP tool.
 - Codex is expected to work directly in `workspace/` and then delegate back to Claude through an MCP tool.
 - The script still alternates turns, so delegation happens inside each turn rather than replacing the loop.

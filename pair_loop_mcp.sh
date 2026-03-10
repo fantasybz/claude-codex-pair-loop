@@ -9,6 +9,9 @@
 #   --log-dir PATH          Log directory (default: ./logs)
 #   --task TEXT             Task description
 #   --max-iterations N      Maximum iterations (default: 999999)
+#   --first-agent NAME      Turn order: claude or codex (default: claude)
+#   --claude-first          Alias for --first-agent claude
+#   --codex-first           Alias for --first-agent codex
 #   --resume                Resume from existing workspace/logs without cleaning
 #   --keep-logs             Preserve existing logs on startup
 #   --keep-workspace        Preserve existing workspace on startup
@@ -26,6 +29,7 @@ WORKSPACE="$DEFAULT_WORKSPACE"
 LOG_DIR="$DEFAULT_LOG_DIR"
 TASK=""
 MAX_ITERATIONS="999999"
+FIRST_AGENT="claude"
 STATUS_CHECK_TIMEOUT="${STATUS_CHECK_TIMEOUT:-20}"
 RESUME=0
 KEEP_LOGS=0
@@ -57,7 +61,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 usage() {
-  sed -n '1,16p' "$0"
+  sed -n '1,20p' "$0"
 }
 
 die() {
@@ -556,6 +560,174 @@ run_codex() {
   echo ""
 }
 
+execute_claude_turn() {
+  local incoming_summary="$1"
+  local is_first_turn="$2"
+  local files_snapshot tmp_root
+
+  files_snapshot="$(workspace_snapshot)"
+  tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/pairloopmcpclaudeXXXXXX")"
+  snapshot_workspace "$tmp_root/before"
+
+  if [ "$CLAUDE_AVAILABLE" -eq 1 ]; then
+    if [ "$is_first_turn" -eq 1 ]; then
+      CLAUDE_PROMPT="You are in a pair-programming loop with OpenAI Codex. You go first.
+
+TASK: $TASK
+
+This is iteration $ITERATION. The workspace is currently at: $WORKSPACE
+$CODEX_STATUS_NOTE
+
+Current workspace files:
+$files_snapshot
+
+## Your workflow:
+
+1. Read .loop_state.md and review the workspace.
+2. Do your part: implement, fix bugs, add tests, improve docs, or refactor.
+$CLAUDE_DELEGATION_STEP
+$CLAUDE_FOLLOWUP_STEP
+5. Update .loop_state.md with what happened this iteration.
+
+Build incrementally. Do not rewrite everything."
+    else
+      CLAUDE_PROMPT="You are in a pair-programming loop with OpenAI Codex. This is iteration $ITERATION.
+
+TASK: $TASK
+WORKSPACE: $WORKSPACE
+$CODEX_STATUS_NOTE
+
+Codex handoff summary:
+---
+$incoming_summary
+---
+
+Current workspace files:
+$files_snapshot
+
+## Your workflow:
+
+1. Read .loop_state.md and review the workspace.
+2. Do your part: implement, fix bugs, add tests, improve docs, or refactor.
+$CLAUDE_DELEGATION_STEP
+$CLAUDE_FOLLOWUP_STEP
+5. Update .loop_state.md with what happened this iteration.
+
+Build incrementally. Do not rewrite everything."
+    fi
+
+    if run_claude "$CLAUDE_PROMPT"; then
+      CLAUDE_TURN_STATUS="completed"
+      CLAUDE_TURN_REASON=""
+    else
+      CLAUDE_TURN_STATUS="failed"
+      CLAUDE_TURN_REASON="Claude Code execution failed; inspect $CLAUDE_LOG"
+      echo -e "${YELLOW}Claude Code failed during iteration $ITERATION. Continuing if Codex is available.${NC}"
+      echo ""
+    fi
+  else
+    write_skip_log "$CLAUDE_LOG" "Claude Code" "Unavailable at iteration start: $CLAUDE_STATUS_REASON"
+    CLAUDE_TURN_STATUS="skipped"
+    CLAUDE_TURN_REASON="Unavailable at iteration start: $CLAUDE_STATUS_REASON"
+    echo -e "${YELLOW}Skipping Claude Code for iteration $ITERATION: $CLAUDE_STATUS_REASON${NC}"
+    echo ""
+  fi
+
+  snapshot_workspace "$tmp_root/after"
+  write_turn_handoff \
+    "Claude Code" \
+    "$CLAUDE_HANDOFF" \
+    "$CLAUDE_TURN_STATUS" \
+    "$CLAUDE_TURN_REASON" \
+    "$tmp_root/before" \
+    "$tmp_root/after"
+  rm -rf "$tmp_root"
+}
+
+execute_codex_turn() {
+  local incoming_summary="$1"
+  local is_first_turn="$2"
+  local files_snapshot tmp_root
+
+  files_snapshot="$(workspace_snapshot)"
+  tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/pairloopmcpcodexXXXXXX")"
+  snapshot_workspace "$tmp_root/before"
+
+  if [ "$CODEX_AVAILABLE" -eq 1 ]; then
+    if [ "$is_first_turn" -eq 1 ]; then
+      CODEX_PROMPT="You are in a pair-programming loop with Claude Code. You go first.
+
+TASK: $TASK
+
+This is iteration $ITERATION. The workspace is currently at: $WORKSPACE
+$CLAUDE_STATUS_NOTE
+
+Current workspace files:
+$files_snapshot
+
+## Your workflow:
+
+1. Read .loop_state.md and review the workspace.
+2. Do your part: improve code, fix bugs, add tests, or refactor.
+$CODEX_DELEGATION_STEP
+$CODEX_FOLLOWUP_STEP
+5. Update .loop_state.md with what happened this iteration.
+
+Build incrementally. Do not rewrite everything."
+    else
+      CODEX_PROMPT="You are in a pair-programming loop with Claude Code. This is iteration $ITERATION.
+
+TASK: $TASK
+WORKSPACE: $WORKSPACE
+$CLAUDE_STATUS_NOTE
+
+Claude handoff summary:
+---
+$incoming_summary
+---
+
+Current workspace files:
+$files_snapshot
+
+## Your workflow:
+
+1. Read .loop_state.md and review the workspace.
+2. Do your part: improve code, fix bugs, add tests, or refactor.
+$CODEX_DELEGATION_STEP
+$CODEX_FOLLOWUP_STEP
+5. Update .loop_state.md with what happened this iteration.
+
+Build incrementally. Do not rewrite everything."
+    fi
+
+    if run_codex "$CODEX_PROMPT"; then
+      CODEX_TURN_STATUS="completed"
+      CODEX_TURN_REASON=""
+    else
+      CODEX_TURN_STATUS="failed"
+      CODEX_TURN_REASON="Codex execution failed; inspect $CODEX_LOG"
+      echo -e "${YELLOW}Codex failed during iteration $ITERATION. Continuing to the next iteration.${NC}"
+      echo ""
+    fi
+  else
+    write_skip_log "$CODEX_LOG" "Codex" "Unavailable at iteration start: $CODEX_STATUS_REASON"
+    CODEX_TURN_STATUS="skipped"
+    CODEX_TURN_REASON="Unavailable at iteration start: $CODEX_STATUS_REASON"
+    echo -e "${YELLOW}Skipping Codex for iteration $ITERATION: $CODEX_STATUS_REASON${NC}"
+    echo ""
+  fi
+
+  snapshot_workspace "$tmp_root/after"
+  write_turn_handoff \
+    "Codex" \
+    "$CODEX_HANDOFF" \
+    "$CODEX_TURN_STATUS" \
+    "$CODEX_TURN_REASON" \
+    "$tmp_root/before" \
+    "$tmp_root/after"
+  rm -rf "$tmp_root"
+}
+
 run_startup_health_checks() {
   echo -e "${CYAN}Startup health checks:${NC}"
 
@@ -624,6 +796,19 @@ parse_args() {
         MAX_ITERATIONS_FROM_FLAG=1
         shift 2
         ;;
+      --first-agent)
+        [ "$#" -ge 2 ] || die "--first-agent requires a value"
+        FIRST_AGENT="$2"
+        shift 2
+        ;;
+      --claude-first)
+        FIRST_AGENT="claude"
+        shift
+        ;;
+      --codex-first)
+        FIRST_AGENT="codex"
+        shift
+        ;;
       --resume)
         RESUME=1
         KEEP_LOGS=1
@@ -681,6 +866,14 @@ parse_args() {
       die "max_iterations must be a non-negative integer"
       ;;
   esac
+
+  case "$FIRST_AGENT" in
+    claude|codex)
+      ;;
+    *)
+      die "first agent must be either 'claude' or 'codex'"
+      ;;
+  esac
 }
 
 parse_args "$@"
@@ -704,6 +897,7 @@ echo -e "${YELLOW}Workspace:${NC} $WORKSPACE"
 echo -e "${YELLOW}Log dir:${NC} $LOG_DIR"
 echo -e "${YELLOW}MCP config:${NC} $CLAUDE_MCP_CONFIG"
 echo -e "${YELLOW}Max iterations:${NC} $MAX_ITERATIONS"
+echo -e "${YELLOW}First agent:${NC} $FIRST_AGENT"
 echo -e "${YELLOW}Resume mode:${NC} $RESUME"
 echo -e "${YELLOW}Keep workspace:${NC} $KEEP_WORKSPACE"
 echo -e "${YELLOW}Keep logs:${NC} $KEEP_LOGS"
@@ -760,130 +954,38 @@ while [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; do
     CODEX_FOLLOWUP_STEP="4. Since Claude Code is unavailable, leave a clear handoff note for the next available Claude turn."
   fi
 
-  FILES_SNAPSHOT="$(workspace_snapshot)"
   CLAUDE_LOG="$LOG_DIR/claude_mcp_iter${ITERATION}.log"
   CODEX_LOG="$LOG_DIR/codex_mcp_iter${ITERATION}.log"
   CLAUDE_HANDOFF="$LOG_DIR/claude_mcp_handoff_iter${ITERATION}.md"
   CODEX_HANDOFF="$LOG_DIR/codex_mcp_handoff_iter${ITERATION}.md"
 
-  if [ "$ITERATION" -eq "$FIRST_ITERATION_OF_THIS_RUN" ] && [ "$RESUME" -eq 0 ]; then
-    PREVIOUS_CODEX_SUMMARY="No prior Codex handoff summary is available for this run."
-  else
-    PREVIOUS_CODEX_SUMMARY="$(read_handoff_summary "$LOG_DIR/codex_mcp_handoff_iter$((ITERATION - 1)).md" "No prior Codex handoff summary is available.")"
-  fi
-
-  CLAUDE_TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pairloopmcpclaudeXXXXXX")"
-  snapshot_workspace "$CLAUDE_TMP_ROOT/before"
-
-  if [ "$CLAUDE_AVAILABLE" -eq 1 ]; then
-    CLAUDE_PROMPT="You are in a pair-programming loop with OpenAI Codex. This is iteration $ITERATION.
-
-TASK: $TASK
-WORKSPACE: $WORKSPACE
-$CODEX_STATUS_NOTE
-
-Codex handoff summary:
----
-$PREVIOUS_CODEX_SUMMARY
----
-
-Current workspace files:
-$FILES_SNAPSHOT
-
-## Your workflow:
-
-1. Read .loop_state.md and review the workspace.
-2. Do your part: implement, fix bugs, add tests, improve docs, or refactor.
-$CLAUDE_DELEGATION_STEP
-$CLAUDE_FOLLOWUP_STEP
-5. Update .loop_state.md with what happened this iteration.
-
-Build incrementally. Do not rewrite everything."
-
-    if run_claude "$CLAUDE_PROMPT"; then
-      CLAUDE_TURN_STATUS="completed"
-      CLAUDE_TURN_REASON=""
+  if [ "$FIRST_AGENT" = "claude" ]; then
+    if [ "$ITERATION" -eq "$FIRST_ITERATION_OF_THIS_RUN" ] && [ "$RESUME" -eq 0 ]; then
+      FIRST_TURN_SUMMARY="No prior Codex handoff summary is available for this run."
+      FIRST_TURN_IS_FRESH=1
     else
-      CLAUDE_TURN_STATUS="failed"
-      CLAUDE_TURN_REASON="Claude Code execution failed; inspect $CLAUDE_LOG"
-      echo -e "${YELLOW}Claude Code failed during iteration $ITERATION. Continuing if Codex is available.${NC}"
-      echo ""
+      FIRST_TURN_SUMMARY="$(read_handoff_summary "$LOG_DIR/codex_mcp_handoff_iter$((ITERATION - 1)).md" "No prior Codex handoff summary is available.")"
+      FIRST_TURN_IS_FRESH=0
     fi
   else
-    write_skip_log "$CLAUDE_LOG" "Claude Code" "Unavailable at iteration start: $CLAUDE_STATUS_REASON"
-    CLAUDE_TURN_STATUS="skipped"
-    CLAUDE_TURN_REASON="Unavailable at iteration start: $CLAUDE_STATUS_REASON"
-    echo -e "${YELLOW}Skipping Claude Code for iteration $ITERATION: $CLAUDE_STATUS_REASON${NC}"
-    echo ""
-  fi
-
-  snapshot_workspace "$CLAUDE_TMP_ROOT/after"
-  write_turn_handoff \
-    "Claude Code" \
-    "$CLAUDE_HANDOFF" \
-    "$CLAUDE_TURN_STATUS" \
-    "$CLAUDE_TURN_REASON" \
-    "$CLAUDE_TMP_ROOT/before" \
-    "$CLAUDE_TMP_ROOT/after"
-  rm -rf "$CLAUDE_TMP_ROOT"
-
-  FILES_SNAPSHOT="$(workspace_snapshot)"
-  CLAUDE_SUMMARY="$(read_handoff_summary "$CLAUDE_HANDOFF" "No Claude handoff summary is available for this iteration.")"
-
-  CODEX_TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pairloopmcpcodexXXXXXX")"
-  snapshot_workspace "$CODEX_TMP_ROOT/before"
-
-  if [ "$CODEX_AVAILABLE" -eq 1 ]; then
-    CODEX_PROMPT="You are in a pair-programming loop with Claude Code. This is iteration $ITERATION.
-
-TASK: $TASK
-WORKSPACE: $WORKSPACE
-$CLAUDE_STATUS_NOTE
-
-Claude handoff summary:
----
-$CLAUDE_SUMMARY
----
-
-Current workspace files:
-$FILES_SNAPSHOT
-
-## Your workflow:
-
-1. Read .loop_state.md and review the workspace.
-2. Do your part: improve code, fix bugs, add tests, or refactor.
-$CODEX_DELEGATION_STEP
-$CODEX_FOLLOWUP_STEP
-5. Update .loop_state.md with what happened this iteration.
-
-Build incrementally. Do not rewrite everything."
-
-    if run_codex "$CODEX_PROMPT"; then
-      CODEX_TURN_STATUS="completed"
-      CODEX_TURN_REASON=""
+    if [ "$ITERATION" -eq "$FIRST_ITERATION_OF_THIS_RUN" ] && [ "$RESUME" -eq 0 ]; then
+      FIRST_TURN_SUMMARY="No prior Claude handoff summary is available for this run."
+      FIRST_TURN_IS_FRESH=1
     else
-      CODEX_TURN_STATUS="failed"
-      CODEX_TURN_REASON="Codex execution failed; inspect $CODEX_LOG"
-      echo -e "${YELLOW}Codex failed during iteration $ITERATION. Continuing to the next iteration.${NC}"
-      echo ""
+      FIRST_TURN_SUMMARY="$(read_handoff_summary "$LOG_DIR/claude_mcp_handoff_iter$((ITERATION - 1)).md" "No prior Claude handoff summary is available.")"
+      FIRST_TURN_IS_FRESH=0
     fi
-  else
-    write_skip_log "$CODEX_LOG" "Codex" "Unavailable at iteration start: $CODEX_STATUS_REASON"
-    CODEX_TURN_STATUS="skipped"
-    CODEX_TURN_REASON="Unavailable at iteration start: $CODEX_STATUS_REASON"
-    echo -e "${YELLOW}Skipping Codex for iteration $ITERATION: $CODEX_STATUS_REASON${NC}"
-    echo ""
   fi
 
-  snapshot_workspace "$CODEX_TMP_ROOT/after"
-  write_turn_handoff \
-    "Codex" \
-    "$CODEX_HANDOFF" \
-    "$CODEX_TURN_STATUS" \
-    "$CODEX_TURN_REASON" \
-    "$CODEX_TMP_ROOT/before" \
-    "$CODEX_TMP_ROOT/after"
-  rm -rf "$CODEX_TMP_ROOT"
+  if [ "$FIRST_AGENT" = "claude" ]; then
+    execute_claude_turn "$FIRST_TURN_SUMMARY" "$FIRST_TURN_IS_FRESH"
+    NEXT_TURN_SUMMARY="$(read_handoff_summary "$CLAUDE_HANDOFF" "No Claude handoff summary is available for this iteration.")"
+    execute_codex_turn "$NEXT_TURN_SUMMARY" 0
+  else
+    execute_codex_turn "$FIRST_TURN_SUMMARY" "$FIRST_TURN_IS_FRESH"
+    NEXT_TURN_SUMMARY="$(read_handoff_summary "$CODEX_HANDOFF" "No Codex handoff summary is available for this iteration.")"
+    execute_claude_turn "$NEXT_TURN_SUMMARY" 0
+  fi
 
   echo -e "${CYAN}━━━ Iteration $ITERATION complete ━━━${NC}"
   echo -e "  Claude log: $CLAUDE_LOG"
