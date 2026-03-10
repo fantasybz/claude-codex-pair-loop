@@ -1,53 +1,25 @@
 # Claude Code <-> Codex Pair Tools
 
-This README documents the two launcher scripts in this repository and the wrapper skills built on top of them:
+Local launcher scripts for running repeatable pair-programming loops between Claude Code and Codex.
 
-- [`pair_loop.sh`](./pair_loop.sh) runs a simple alternating turn-based loop.
-- [`pair_loop_mcp.sh`](./pair_loop_mcp.sh) runs a more experimental loop where each agent can also delegate back to the other through MCP during its turn.
-- [`skills/claude-first-pair-loop`](./skills/claude-first-pair-loop) wraps the scripts with Claude-first turn order.
-- [`skills/codex-first-pair-loop`](./skills/codex-first-pair-loop) wraps the scripts with Codex-first turn order.
+The tools share a workspace, maintain structured loop state, write per-turn logs and handoffs, and support validation-driven stop conditions. They are designed for local use with authenticated CLIs already installed.
 
-`workspace/` and `logs/` are generated runtime output directories. They are disposable by default and are ignored by Git.
+`workspace/` and `logs/` are generated runtime directories. They are disposable by default and ignored by Git.
 
-## What each script does
+## Overview
 
-| Script | Mode | Best for |
+| Tool | Purpose | Recommended use |
 | --- | --- | --- |
-| `pair_loop.sh` | Alternating CLI turns | Simpler, easier-to-debug pair runs |
-| `pair_loop_mcp.sh` | Alternating CLI turns plus cross-agent MCP delegation | Experiments where each agent should be able to call the other mid-turn |
+| [`pair_loop.sh`](./pair_loop.sh) | Alternating turns between Claude and Codex | Default choice for most runs |
+| [`pair_loop_mcp.sh`](./pair_loop_mcp.sh) | Alternating turns plus cross-agent MCP delegation inside each turn | Experimental runs that need richer agent-to-agent interaction |
+| [`skills/claude-first-pair-loop`](./skills/claude-first-pair-loop) | Wrapper skill for Claude-first runs | Reusable agent workflow |
+| [`skills/codex-first-pair-loop`](./skills/codex-first-pair-loop) | Wrapper skill for Codex-first runs | Reusable agent workflow |
 
-## How the loop works
-
-At startup, both scripts now do the following:
-
-1. Parse flags such as `--workspace`, `--log-dir`, `--profile`, `--claude-model`, `--codex-model`, `--session-name`, `--validation-command`, `--resume`, `--keep-logs`, and `--non-destructive`.
-2. Run up-front health checks for Claude, Codex, Node.js, and MCP availability.
-3. Clean or preserve `workspace/` and `logs/` based on the selected flags.
-4. Ensure the workspace is a Git repository because Codex expects one.
-5. Create or reuse structured state files at `workspace/.loop_state.md` and `workspace/.loop_state.json`.
-
-During each iteration:
-
-1. The scripts perform a lightweight availability check for both agents.
-2. Claude takes a turn and writes a transcript to `logs/`, or the turn is skipped if Claude is unavailable.
-3. Codex takes a turn and writes a transcript to `logs/`, or the turn is skipped if Codex is unavailable.
-4. After each turn, the script writes a diff-aware handoff summary for the next agent.
-5. The loop pauses briefly, then continues until it reaches `max_iterations` or you stop it with `Ctrl-C`.
-
-The handoff is now diff-aware instead of log-tail based. Each turn compares the workspace before and after the agent run, writes a file-change summary, includes current Git status, and carries forward the latest `.loop_state.md` tail.
-
-The state file is now structured instead of freeform. The scripts preserve human-managed sections such as Success Criteria, File Focus, Open Decisions, and Risks, while automatically regenerating Session, Current Status, Next Handoff, Iteration Ledger, and the `.loop_state.json` mirror.
-
-Availability checks currently work like this:
-
-- Claude: a lightweight `claude -p` ping, which acts as an account/usage check
-- Codex: `codex login status`
-
-If a check fails, the script writes a skip note into that iteration's log file and continues with the next available agent instead of exiting immediately.
+If you want the most predictable execution path, start with `pair_loop.sh`.
 
 ## Requirements
 
-The scripts are written for a local machine with the relevant CLIs already installed and authenticated.
+These scripts are intended for a local machine, not a hosted CI environment.
 
 - Bash
 - Node.js v20+
@@ -55,35 +27,22 @@ The scripts are written for a local machine with the relevant CLIs already insta
 - `codex` CLI
 - `npx`
 
-Expected setup from the scripts themselves:
+Expected local setup:
 
 - `pair_loop.sh` expects `claude -p --dangerously-skip-permissions` to work.
 - `pair_loop.sh` expects `codex exec --full-auto` to work.
-- `pair_loop_mcp.sh` expects Claude to load the repo-local [`.mcp.json`](./.mcp.json), which currently launches `codex-mcp-server` through `npx`.
-- `pair_loop_mcp.sh` attempts to register a `claude-code` MCP server for Codex if it does not already exist:
+- `pair_loop_mcp.sh` expects Claude to load the repo-local [`.mcp.json`](./.mcp.json).
+- `pair_loop_mcp.sh` may register a `claude-code` MCP server for Codex if it does not already exist.
+
+The current Codex-side MCP registration command is:
 
 ```bash
 codex mcp add claude-code -- npx -y @steipete/claude-code-mcp@latest
 ```
 
-If the required MCP packages are not cached locally, `npx` may need network access the first time it runs.
+If the MCP packages are not already cached, `npx` may need network access on the first run.
 
-## Current MCP components
-
-As currently configured in this repo, [`pair_loop_mcp.sh`](./pair_loop_mcp.sh) depends on two external MCP projects:
-
-| Direction | Local config | Upstream project |
-| --- | --- | --- |
-| Claude -> Codex | [`.mcp.json`](./.mcp.json) starts `npx -y codex-mcp-server` under the MCP server name `codex-cli` | [`codex-mcp-server`](https://github.com/tuannvm/codex-mcp-server) |
-| Codex -> Claude | [`pair_loop_mcp.sh`](./pair_loop_mcp.sh) runs `codex mcp add claude-code -- npx -y @steipete/claude-code-mcp@latest` when the server is not already registered | [`@steipete/claude-code-mcp`](https://github.com/steipete/claude-code-mcp) |
-
-Notes:
-
-- These MCP dependencies are referenced from upstream packages and are not vendored into this repository.
-- The current script uses `@latest` for `@steipete/claude-code-mcp`, so future runs may pick up newer upstream behavior.
-- The current [`.mcp.json`](./.mcp.json) also does not pin a specific `codex-mcp-server` version.
-
-## Quick start
+## Quick Start
 
 If the scripts are not executable in your clone:
 
@@ -91,7 +50,7 @@ If the scripts are not executable in your clone:
 chmod +x pair_loop.sh pair_loop_mcp.sh
 ```
 
-Run the basic loop:
+Run the standard loop:
 
 ```bash
 ./pair_loop.sh "Build a Python CLI that parses Markdown front matter and outputs JSON" 3
@@ -103,28 +62,22 @@ Run the MCP-enabled loop:
 ./pair_loop_mcp.sh "Build a Python CLI that parses Markdown front matter and outputs JSON" 3
 ```
 
+Resume an existing run:
+
+```bash
+./pair_loop.sh --resume --workspace ./workspace --log-dir ./logs
+```
+
 Run in non-destructive mode:
 
 ```bash
 ./pair_loop.sh --non-destructive --task "Improve an existing CLI tool"
 ```
 
-Resume an existing MCP run:
-
-```bash
-./pair_loop_mcp.sh --resume --workspace ./workspace --log-dir ./logs
-```
-
 Run with Codex starting first:
 
 ```bash
 ./pair_loop.sh --codex-first --task "Improve an existing CLI tool"
-```
-
-Run with a deeper reasoning preset:
-
-```bash
-./pair_loop.sh --deep --task "Refactor and harden this service"
 ```
 
 Run with explicit model and effort settings:
@@ -139,7 +92,7 @@ Run with explicit model and effort settings:
   --resume
 ```
 
-Run with session grouping, stop conditions, and checkpoints:
+Run with session grouping, validation, stop conditions, and checkpoints:
 
 ```bash
 ./pair_loop.sh \
@@ -152,134 +105,183 @@ Run with session grouping, stop conditions, and checkpoints:
   --task "Stabilize the service"
 ```
 
-Run through the generated skill wrappers:
+Run through the skill wrappers:
 
 ```bash
-./skills/claude-first-pair-loop/scripts/run-pair-loop.sh --task "Build a CLI tool" --max-iterations 3
-./skills/codex-first-pair-loop/scripts/run-pair-loop.sh --mcp --task "Continue the current project" --resume
+./skills/claude-first-pair-loop/scripts/run-pair-loop.sh \
+  --task "Build a CLI tool" \
+  --max-iterations 3
+
+./skills/codex-first-pair-loop/scripts/run-pair-loop.sh \
+  --mcp \
+  --task "Continue the current project" \
+  --resume
 ```
 
-Run the live E2E smoke test:
+Run startup checks only:
 
 ```bash
-./tests/e2e_live_pair_loop.sh --require-claude-turn --require-codex-turn
+./pair_loop.sh --healthcheck-only
 ```
 
-Arguments:
+## Command Reference
+
+Positional arguments:
 
 - First argument: task description passed to both agents.
 - Second argument: maximum number of iterations.
 
-If you omit the task, each script falls back to its built-in default Python CLI prompt.
+If you omit the task, each script uses its built-in default Python CLI prompt. If you omit `max_iterations`, both scripts default to `999999`.
 
-If you omit `max_iterations`, both scripts default to `999999`, which is effectively "run until stopped".
+Task and execution control:
 
-Supported flags:
+- `--task TEXT`
+- `--max-iterations N`
+- `--workspace PATH`
+- `--log-dir PATH`
+- `--session-name NAME`
+- `--first-agent claude|codex`
+- `--claude-first`
+- `--codex-first`
+- `--turn-timeout SECONDS`
+- `--healthcheck-only`
 
-- `--workspace PATH`: use a custom workspace directory
-- `--log-dir PATH`: use a custom log directory
-- `--task TEXT`: pass the task as a flag instead of a positional argument
-- `--max-iterations N`: pass the iteration count as a flag
-- `--profile fast|balanced|deep`: set effort defaults for both agents
-- `--fast`, `--balanced`, `--deep`: aliases for `--profile`
-- `--claude-model MODEL`: choose the Claude model for each Claude turn
-- `--codex-model MODEL`: choose the Codex model for each Codex turn
-- `--claude-effort low|medium|high`: choose Claude effort level
-- `--codex-effort low|medium|high|xhigh`: choose Codex reasoning effort
-- `--role-preset balanced|docs-refactor|reviewer-builder`: bias each agent toward a different role
-- `--session-name NAME`: group logs and session state artifacts under `logs/NAME/`
-- `--validation-command CMD`: run a validation command after each iteration
-- `--turn-timeout SECONDS`: fail a Claude/Codex turn if it exceeds the timeout; `0` disables the limit
-- `--state-max-ledger-entries N`: keep only the most recent N detailed iterations in `.loop_state.md`
-- `--until-tests-pass`: stop when validation succeeds
-- `--until-checklist-complete`: stop when all Success Criteria checkboxes are checked
-- `--until-clean-git`: stop when the workspace Git status is clean
-- `--checkpoint-commits`: create a checkpoint commit after each iteration if there are changes
-- `--checkpoint-tags`: create a checkpoint tag after each iteration
-- `--first-agent claude|codex`: choose which agent starts each iteration
-- `--claude-first`: alias for `--first-agent claude`
-- `--codex-first`: alias for `--first-agent codex`
-- `--resume`: continue from the current workspace and existing logs without cleaning them
-- `--keep-logs`: preserve existing log files on startup
-- `--keep-workspace`: preserve the existing workspace on startup
-- `--non-destructive`: preserve both workspace and logs
-- `--healthcheck-only`: run startup checks and exit before preparing a workspace or logs
+Model, effort, and role configuration:
 
-`--resume` implies preserving both workspace and logs.
+- `--profile fast|balanced|deep`
+- `--fast`
+- `--balanced`
+- `--deep`
+- `--claude-model MODEL`
+- `--codex-model MODEL`
+- `--claude-effort low|medium|high`
+- `--codex-effort low|medium|high|xhigh`
+- `--role-preset balanced|docs-refactor|reviewer-builder`
 
-Notes on model and effort settings:
+Validation, stop conditions, and checkpoints:
 
-- The profile presets only affect effort defaults. They do not force a specific model.
+- `--validation-command CMD`
+- `--until-tests-pass`
+- `--until-checklist-complete`
+- `--until-clean-git`
+- `--checkpoint-commits`
+- `--checkpoint-tags`
+
+State preservation:
+
+- `--resume`
+- `--keep-logs`
+- `--keep-workspace`
+- `--non-destructive`
+
+Behavior notes:
+
+- `--resume` implies preserving both workspace and logs.
+- Profile presets only affect effort defaults. They do not force a specific model.
 - Explicit `--claude-effort` or `--codex-effort` overrides the profile default for that agent.
-- Claude effort is passed through as the native `claude --effort` option.
+- Claude effort is passed through as `claude --effort`.
 - Codex effort is passed through as `codex exec -c model_reasoning_effort="..."`.
 
-Notes on state, sessions, and stop conditions:
+## How the Loop Works
 
-- The live state mirrors are always `workspace/.loop_state.md` and `workspace/.loop_state.json`.
-- When `--session-name` is set, logs, handoffs, validation logs, `run_summary.json`, and session copies of the state files are grouped under `logs/<session>/`.
-- `--until-tests-pass` uses `--validation-command` when provided, or attempts a best-effort auto-detection of common test commands.
-- `--until-checklist-complete` reads unchecked boxes from the `Success Criteria` section of `.loop_state.md`.
-- `--until-clean-git` checks the workspace repo while ignoring the generated `.loop_state` files.
-- `run_summary.json` is runner-owned state that captures startup health checks, final stop reason, validation status, and final per-agent statuses without relying on agent-edited files.
+At startup, both scripts:
 
-## Runtime output
+1. Parse flags and resolve runtime configuration.
+2. Run startup health checks for Claude, Codex, Node.js, and MCP availability.
+3. Clean or preserve `workspace/` and `logs/` based on the selected flags.
+4. Ensure the workspace is a Git repository because Codex expects one.
+5. Create or reuse structured state files at `workspace/.loop_state.md` and `workspace/.loop_state.json`.
+6. Initialize `run_summary.json` for the active session.
 
-The scripts generate temporary output in two directories:
+During each iteration:
 
-- `workspace/`: the current generated project state, including `workspace/.loop_state.md` and `workspace/.loop_state.json`
-- `logs/`: per-iteration transcripts such as `claude_iterN.log`, `codex_iterN.log`, `claude_mcp_iterN.log`, and `codex_mcp_iterN.log`
-- handoff files in `logs/`: diff-aware summaries such as `claude_handoff_iterN.md`, `codex_handoff_iterN.md`, `claude_mcp_handoff_iterN.md`, and `codex_mcp_handoff_iterN.md`
-- validation logs in `logs/`: files such as `validation_iterN.log`
-- `run_summary.json` in the active log directory: final runner-owned summary for the session
-- session state mirrors in `logs/<session>/state/` when `--session-name` is used
+1. The scripts perform a lightweight availability check for both agents.
+2. The first agent takes a turn or is skipped if unavailable.
+3. The runner writes a per-turn log and a diff-aware handoff summary.
+4. The second agent takes a turn or is skipped if unavailable.
+5. The runner runs validation if configured or auto-detectable.
+6. Stop conditions are evaluated and the state files are regenerated.
+7. The loop either continues, stops because conditions were met, or exits when interrupted or capped by `max_iterations`.
 
-The terminal output also prints:
+Availability checks currently work like this:
 
-- the active task
-- the workspace path
-- the log directory path
-- the active profile, model, and effort settings
-- the active role preset and session name
-- the current iteration number
-- the log file paths for each completed iteration
+- Claude: a lightweight `claude -p` ping
+- Codex: `codex login status`
 
-## Live E2E test
+If a check fails, the runner writes a skip log and continues with the next available agent instead of aborting immediately.
 
-The repo now includes a live smoke test at [`tests/e2e_live_pair_loop.sh`](./tests/e2e_live_pair_loop.sh).
+## State and Artifacts
 
-What it does:
+Primary runtime artifacts:
 
-- runs `pair_loop.sh` by default, or `pair_loop_mcp.sh` with `--mode mcp`
-- uses a throwaway workspace and log directory under `/tmp`
-- asks the loop to create `smoke.txt` with exact content
-- verifies `workspace/.loop_state.md`, `workspace/.loop_state.json`, final-iteration validation logs, session-state mirrors, and `run_summary.json`
-- checks the runner-owned summary to confirm validation finished with `passed`
-- removes generated artifacts only when `--cleanup` is requested and the E2E run succeeds
+- `workspace/.loop_state.md`: human-readable loop state
+- `workspace/.loop_state.json`: machine-readable loop state
+- `logs/.../*.log`: per-turn and validation logs
+- `logs/.../*handoff_iterN.md`: handoff summaries between turns
+- `logs/.../run_summary.json`: runner-owned final summary for the session
+- `logs/<session>/state/`: session-scoped mirrors of the state files when `--session-name` is used
 
-Important limitations:
+State behavior:
 
-- this is a real integration test, not a mocked unit test
-- it consumes real Claude/Codex usage
-- it requires authenticated local CLIs and working network access
-- it is not suitable for sandboxed or offline CI by default
+- `.loop_state.md` preserves human-managed sections such as Success Criteria, File Focus, Open Decisions, and Risks.
+- The runner regenerates Session, Current Status, Next Handoff, Iteration Ledger, and stop-condition status.
+- Handoff files are diff-aware. They include a change summary, current Git status, workspace snapshot, and a runner-owned state snapshot.
+- Turn logs record both configured and resolved runtime model and effort when the underlying CLI exposes those values.
+- `.loop_state.json` and `run_summary.json` split stop-condition data into `configured`, `current`, and `summary` so tooling can distinguish enabled checks from checks that are currently met.
 
-Useful options:
+Session behavior:
 
-- `--mode standard|mcp`
-- `--first-agent claude|codex`
-- `--require-claude-turn`
-- `--require-codex-turn`
-- `--cleanup`
-- `--` to pass extra loop flags through to the underlying pair-loop script
+- Without `--session-name`, logs are written directly under `logs/`.
+- With `--session-name`, logs, handoffs, validation logs, `run_summary.json`, and state mirrors are grouped under `logs/<session>/`.
 
-## Local CI and hooks
+## Script Details
 
-If you want local-only checks on every commit, this repo now includes:
+### `pair_loop.sh`
+
+`pair_loop.sh` is the simpler and more explicit mode.
+
+- Claude starts first by default.
+- You can switch to Codex-first with `--first-agent codex` or `--codex-first`.
+- The agents alternate direct turns against the same workspace.
+- The first agent receives the previous handoff summary from the other agent.
+- The second agent receives the current handoff summary from the first agent.
+
+Use this mode when you want clearer logs, fewer moving parts, and easier debugging.
+
+### `pair_loop_mcp.sh`
+
+`pair_loop_mcp.sh` keeps the same outer loop, but changes what happens inside each turn.
+
+- Claude can delegate back to Codex through MCP during Claude's turn.
+- Codex can delegate back to Claude through MCP during Codex's turn.
+- The outer script still alternates turns, so MCP delegation happens inside the turn rather than replacing the loop.
+
+Use this mode when you want richer collaboration patterns and you are comfortable with a more fragile runtime model.
+
+### Current MCP Components
+
+As configured in this repository, MCP mode depends on external MCP projects:
+
+| Direction | Local config | Upstream project |
+| --- | --- | --- |
+| Claude -> Codex | [`.mcp.json`](./.mcp.json) starts `npx -y codex-mcp-server` under the MCP server name `codex-cli` | [`codex-mcp-server`](https://github.com/tuannvm/codex-mcp-server) |
+| Codex -> Claude | [`pair_loop_mcp.sh`](./pair_loop_mcp.sh) runs `codex mcp add claude-code -- npx -y @steipete/claude-code-mcp@latest` when needed | [`@steipete/claude-code-mcp`](https://github.com/steipete/claude-code-mcp) |
+
+Operational notes:
+
+- These MCP dependencies are referenced from upstream packages and are not vendored into this repository.
+- The current setup does not pin a specific `codex-mcp-server` version.
+- The current setup uses `@latest` for `@steipete/claude-code-mcp`, so future runs may pick up newer upstream behavior.
+
+## Testing and Local Automation
+
+### Local CI and Hooks
+
+This repository includes a local-only workflow for deterministic checks and live authenticated smoke tests:
 
 - [`scripts/local-ci.sh`](./scripts/local-ci.sh): local runner for deterministic checks, live E2E, and hook installation
 - [`.githooks/pre-commit`](./.githooks/pre-commit): fast deterministic checks before each commit
-- [`.githooks/post-commit`](./.githooks/post-commit): starts the live authenticated Claude/Codex E2E in the background after each commit
+- [`.githooks/post-commit`](./.githooks/post-commit): background live E2E after each commit
 
 Enable the hooks for this clone:
 
@@ -288,7 +290,7 @@ chmod +x scripts/local-ci.sh .githooks/pre-commit .githooks/post-commit
 bash scripts/local-ci.sh install-hooks
 ```
 
-Useful local commands:
+Useful commands:
 
 ```bash
 bash scripts/local-ci.sh deterministic
@@ -296,117 +298,118 @@ bash scripts/local-ci.sh live
 bash scripts/local-ci.sh all
 ```
 
-Notes:
+Operational notes:
 
-- The post-commit hook is intentionally non-blocking. It starts the live E2E in the background and writes output under `logs/local-ci/`.
-- Only one background live E2E is started at a time; later commits skip launching a second one while the first is still running.
-- [`tests/e2e_live_pair_loop.sh`](./tests/e2e_live_pair_loop.sh) still uses your local authenticated `claude` and `codex` CLIs, so the post-commit hook consumes real usage.
-- You can copy [`.local-ci.env.example`](./.local-ci.env.example) to `.local-ci.env` to override local defaults such as mode, iteration count, or whether post-commit live runs are enabled.
+- The post-commit hook is non-blocking.
+- Background live E2E output is written under `logs/local-ci/`.
+- Only one background live E2E is started at a time.
+- Live runs use your local authenticated `claude` and `codex` CLIs and consume real usage.
+- You can copy [`.local-ci.env.example`](./.local-ci.env.example) to `.local-ci.env` to override local defaults.
 
-## `pair_loop.sh` details
+### Live E2E Smoke Test
 
-`pair_loop.sh` is the more straightforward version.
+The repository includes a live smoke test at [`tests/e2e_live_pair_loop.sh`](./tests/e2e_live_pair_loop.sh).
 
-- Claude starts first by default, but you can switch to Codex-first with `--first-agent codex` or `--codex-first`.
-- By default it starts from a fresh workspace, but `--resume` and `--non-destructive` preserve existing state.
-- The first agent receives the previous handoff summary from the other agent instead of a raw log tail.
-- The second agent then receives the current handoff summary from the first agent.
-- Both agents are instructed to improve the same codebase incrementally and update `.loop_state.md`.
+What it does:
 
-This mode is easier to reason about because all collaboration is explicit in the alternating turns.
+- runs `pair_loop.sh` by default, or `pair_loop_mcp.sh` with `--mode mcp`
+- uses a throwaway workspace and log directory under `/tmp`
+- asks the loop to create `smoke.txt` with exact content
+- verifies `workspace/.loop_state.md`, `workspace/.loop_state.json`, final-iteration validation logs, session-state mirrors, and `run_summary.json`
+- checks the runner-owned summary to confirm validation finished with `passed`
+- removes generated artifacts only when `--cleanup` is requested and the run succeeds
 
-## Agent skills
+Useful options:
 
-The repository now includes two lightweight agent-skill packages under [`skills/`](./skills):
+- `--mode standard|mcp`
+- `--first-agent claude|codex`
+- `--require-claude-turn`
+- `--require-codex-turn`
+- `--cleanup`
+- `--` to pass additional flags through to the underlying loop script
 
-| Skill | Path | What it enforces |
+Important limitations:
+
+- this is a real integration test, not a mocked unit test
+- it consumes real Claude and Codex usage
+- it requires authenticated local CLIs and working network access
+- it is not suitable for sandboxed or offline CI by default
+
+## Agent Skills
+
+The repository includes two lightweight skill packages under [`skills/`](./skills):
+
+| Skill | Path | Purpose |
 | --- | --- | --- |
-| `claude-first-pair-loop` | [`skills/claude-first-pair-loop`](./skills/claude-first-pair-loop) | Runs `pair_loop.sh` or `pair_loop_mcp.sh` with `--claude-first` |
-| `codex-first-pair-loop` | [`skills/codex-first-pair-loop`](./skills/codex-first-pair-loop) | Runs `pair_loop.sh` or `pair_loop_mcp.sh` with `--codex-first` |
+| `claude-first-pair-loop` | [`skills/claude-first-pair-loop`](./skills/claude-first-pair-loop) | Runs the pair loop with Claude taking the first turn |
+| `codex-first-pair-loop` | [`skills/codex-first-pair-loop`](./skills/codex-first-pair-loop) | Runs the pair loop with Codex taking the first turn |
 
 Each skill contains:
 
-- `SKILL.md`: the usage instructions and trigger guidance
-- `agents/openai.yaml`: agent metadata
-- `scripts/run-pair-loop.sh`: a wrapper that selects standard or MCP mode and injects the fixed first-agent flag
+- `SKILL.md` with usage instructions
+- `agents/openai.yaml` with agent metadata
+- `scripts/run-pair-loop.sh` as the wrapper entrypoint
 
-The wrapper scripts accept the same core flags as the underlying tools, including `--profile`, `--claude-model`, `--codex-model`, `--claude-effort`, `--codex-effort`, `--role-preset`, `--session-name`, and `--validation-command`. Pass `--mcp` to switch from standard mode to MCP mode.
+The wrapper scripts accept the same core flags as the underlying tools. Pass `--mcp` to switch from standard mode to MCP mode.
 
-## `pair_loop_mcp.sh` details
+## Safety and Operational Notes
 
-`pair_loop_mcp.sh` keeps the same outer loop, but changes what happens inside each turn.
-
-- Claude starts first by default, but you can switch to Codex-first with `--first-agent codex` or `--codex-first`.
-- Claude is expected to work directly in `workspace/` and then delegate additional work to Codex through an MCP tool.
-- Codex is expected to work directly in `workspace/` and then delegate back to Claude through an MCP tool.
-- The script still alternates turns, so delegation happens inside each turn rather than replacing the loop.
-
-This mode is more powerful, but also more fragile:
-
-- it depends on both MCP server setups working correctly
-- it introduces agent-in-agent behavior that can be harder to debug
-- failures may be less obvious because some work is delegated indirectly
-
-Use this mode when you want to experiment with richer collaboration patterns, not when you need the most predictable execution path.
-
-## Safety notes
-
-These scripts are intentionally aggressive about cleaning state.
+These scripts are intentionally aggressive about cleaning generated state.
 
 - By default they clean the contents of `workspace/` at startup.
 - By default they clean the contents of `logs/` at startup.
 - Use `--keep-workspace`, `--keep-logs`, `--non-destructive`, or `--resume` if you want to preserve existing state.
-- Anything stored there should be considered disposable unless you explicitly preserve it.
+- Anything stored in those directories should be treated as disposable unless you explicitly preserve it.
 
 Other practical caveats:
 
-- The scripts use `set -euo pipefail`, so an unhandled command failure stops the loop.
-- Claude availability checks consume a lightweight `claude -p` request because there is no equivalent local status command for account/usage.
-- The shared context is now diff-aware and state-aware, but still summary-based rather than a full semantic review.
-- Checkpoint commits and tags are optional and only run when you enable the relevant flags.
-- MCP mode assumes the installed CLI behavior matches what the script expects.
+- The scripts use `set -euo pipefail`.
+- Claude availability checks consume a lightweight Claude request because there is no equivalent local status command for account and usage.
+- Shared context is diff-aware and state-aware, but still summary-based.
+- Checkpoint commits and tags are optional and only run when enabled.
+- MCP mode assumes the installed CLI behavior matches what the scripts expect.
 
 ## Troubleshooting
 
-If a run fails, start with the generated logs under [`logs/`](./logs).
+If a run fails, start with the generated files under [`logs/`](./logs).
 
 Common issues:
 
 - `claude: command not found` or `codex: command not found`
-  Install the missing CLI and ensure it is on `PATH`.
-
 - authentication failures
-  Re-authenticate the affected CLI before rerunning.
-
 - MCP server not available in `pair_loop_mcp.sh`
-  Check [`.mcp.json`](./.mcp.json), run `codex mcp list`, and confirm `npx` can launch the required packages.
+- expected files missing from `workspace/`
+- loop keeps running longer than expected
 
-- nothing useful remains in `workspace/`
-  That may be expected if the run failed early or if you started a new run without a preserve flag.
+Typical fixes:
 
-- loop keeps running
-  Press `Ctrl-C` to stop it.
+- Install the missing CLI and ensure it is on `PATH`.
+- Re-authenticate the affected CLI.
+- Check [`.mcp.json`](./.mcp.json), run `codex mcp list`, and confirm `npx` can launch the required packages.
+- Re-run with `--keep-workspace`, `--keep-logs`, `--non-destructive`, or `--resume` if you need to preserve debugging artifacts.
+- Use `Ctrl-C` to stop a long-running loop manually.
 
-## When to use which script
+## Choosing a Mode
 
-Use `pair_loop.sh` if you want:
+Use `pair_loop.sh` when you want:
 
 - simpler execution
 - clearer logs
 - fewer moving parts
+- easier debugging
 
-Use `pair_loop_mcp.sh` if you want:
+Use `pair_loop_mcp.sh` when you want:
 
 - Claude to call Codex during Claude's turn
 - Codex to call Claude during Codex's turn
 - to experiment with more autonomous cross-agent workflows
 
-## Suggested next improvements
+## Suggested Improvements
 
 If you plan to keep evolving these tools, the highest-value follow-ups are:
 
-1. Add automated tests for the shell flag parsing, structured state rendering, and resume behavior.
+1. Pin MCP package versions instead of relying on `@latest`.
 2. Improve validation auto-detection with more ecosystems and project-specific overrides.
-3. Add smarter checkpoint strategies such as branches or worktrees in addition to commits and tags.
+3. Add richer checkpoint strategies such as branches or worktrees in addition to commits and tags.
 4. Record token and cost metrics if future CLI versions expose them reliably.
-5. Pin MCP package versions instead of relying on `@latest`.
+5. Expand regression coverage as new loop behaviors are added.
