@@ -1,0 +1,4 @@
+interface:
+  display_name: "Claude-First Pair Loop"
+  short_description: "Run pair loops with Claude Code taking the first turn."
+  default_prompt: "Start a Claude-first pair loop for this task. Use standard mode unless MCP is explicitly requested."

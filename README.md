@@ -1,11 +1,13 @@
 # Claude Code <-> Codex Pair Tools
 
-This README documents only the two launcher scripts in this repository:
+This README documents the two launcher scripts in this repository and the wrapper skills built on top of them:
 
 - [`pair_loop.sh`](./pair_loop.sh) runs a simple alternating turn-based loop.
 - [`pair_loop_mcp.sh`](./pair_loop_mcp.sh) runs a more experimental loop where each agent can also delegate back to the other through MCP during its turn.
+- [`skills/claude-first-pair-loop`](./skills/claude-first-pair-loop) wraps the scripts with Claude-first turn order.
+- [`skills/codex-first-pair-loop`](./skills/codex-first-pair-loop) wraps the scripts with Codex-first turn order.
 
-The checked-in [`workspace/`](./workspace) and [`logs/`](./logs) directories are sample artifacts from an MCP trial. They are output examples, not part of the tool implementation.
+`workspace/` and `logs/` are generated runtime output directories. They are disposable by default and are ignored by Git.
 
 ## What each script does
 
@@ -117,6 +119,13 @@ Run with Codex starting first:
 ./pair_loop.sh --codex-first --task "Improve an existing CLI tool"
 ```
 
+Run through the generated skill wrappers:
+
+```bash
+./skills/claude-first-pair-loop/scripts/run-pair-loop.sh --task "Build a CLI tool" --max-iterations 3
+./skills/codex-first-pair-loop/scripts/run-pair-loop.sh --mcp --task "Continue the current project" --resume
+```
+
 Arguments:
 
 - First argument: task description passed to both agents.
@@ -170,6 +179,23 @@ The terminal output also prints:
 
 This mode is easier to reason about because all collaboration is explicit in the alternating turns.
 
+## Agent skills
+
+The repository now includes two lightweight agent-skill packages under [`skills/`](./skills):
+
+| Skill | Path | What it enforces |
+| --- | --- | --- |
+| `claude-first-pair-loop` | [`skills/claude-first-pair-loop`](./skills/claude-first-pair-loop) | Runs `pair_loop.sh` or `pair_loop_mcp.sh` with `--claude-first` |
+| `codex-first-pair-loop` | [`skills/codex-first-pair-loop`](./skills/codex-first-pair-loop) | Runs `pair_loop.sh` or `pair_loop_mcp.sh` with `--codex-first` |
+
+Each skill contains:
+
+- `SKILL.md`: the usage instructions and trigger guidance
+- `agents/openai.yaml`: agent metadata
+- `scripts/run-pair-loop.sh`: a wrapper that selects standard or MCP mode and injects the fixed first-agent flag
+
+The wrapper scripts accept the same core flags as the underlying tools. Pass `--mcp` to switch from standard mode to MCP mode.
+
 ## `pair_loop_mcp.sh` details
 
 `pair_loop_mcp.sh` keeps the same outer loop, but changes what happens inside each turn.
@@ -193,7 +219,6 @@ These scripts are intentionally aggressive about cleaning state.
 
 - By default they clean the contents of `workspace/` at startup.
 - By default they clean the contents of `logs/` at startup.
-- The checked-in contents currently visible in those folders are only sample output from a prior MCP experiment.
 - Use `--keep-workspace`, `--keep-logs`, `--non-destructive`, or `--resume` if you want to preserve existing state.
 - Anything stored there should be considered disposable unless you explicitly preserve it.
 

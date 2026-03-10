@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex-First Pair Loop"
+  short_description: "Run pair loops with Codex taking the first turn."
+  default_prompt: "Start a Codex-first pair loop for this task. Use standard mode unless MCP is explicitly requested."
