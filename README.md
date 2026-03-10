@@ -5,7 +5,7 @@ This README documents only the two launcher scripts in this repository:
 - [`pair_loop.sh`](./pair_loop.sh) runs a simple alternating turn-based loop.
 - [`pair_loop_mcp.sh`](./pair_loop_mcp.sh) runs a more experimental loop where each agent can also delegate back to the other through MCP during its turn.
 
-The checked-in [`workspace/`](./workspace) and [`logs/`](./logs) directories are sample artifacts from an MCP trial. They are output examples, not part of the tool implementation. Both scripts treat those directories as disposable and wipe them at the beginning of a new run.
+The checked-in [`workspace/`](./workspace) and [`logs/`](./logs) directories are sample artifacts from an MCP trial. They are output examples, not part of the tool implementation.
 
 ## What each script does
 
@@ -16,21 +16,23 @@ The checked-in [`workspace/`](./workspace) and [`logs/`](./logs) directories are
 
 ## How the loop works
 
-At startup, both scripts do the same base setup:
+At startup, both scripts now do the following:
 
-1. Delete existing contents under `workspace/` and `logs/`.
-2. Recreate those directories.
-3. Initialize a fresh Git repository inside `workspace/` because Codex expects one.
-4. Write `workspace/.loop_state.md` to track task history between turns.
+1. Parse flags such as `--workspace`, `--log-dir`, `--resume`, `--keep-logs`, and `--non-destructive`.
+2. Run up-front health checks for Claude, Codex, Node.js, and MCP availability.
+3. Clean or preserve `workspace/` and `logs/` based on the selected flags.
+4. Ensure the workspace is a Git repository because Codex expects one.
+5. Create or reuse `workspace/.loop_state.md`.
 
 During each iteration:
 
 1. The scripts perform a lightweight availability check for both agents.
 2. Claude takes a turn and writes a transcript to `logs/`, or the turn is skipped if Claude is unavailable.
 3. Codex takes a turn and writes a transcript to `logs/`, or the turn is skipped if Codex is unavailable.
-4. The loop pauses briefly, then continues until it reaches `max_iterations` or you stop it with `Ctrl-C`.
+4. After each turn, the script writes a diff-aware handoff summary for the next agent.
+5. The loop pauses briefly, then continues until it reaches `max_iterations` or you stop it with `Ctrl-C`.
 
-The scripts pass a lightweight summary between agents by taking the last 80 lines of the previous agent log. This is simple and transparent, but it is not a robust state-sharing mechanism. Important context can be lost if the log is noisy.
+The handoff is now diff-aware instead of log-tail based. Each turn compares the workspace before and after the agent run, writes a file-change summary, includes current Git status, and carries forward the latest `.loop_state.md` tail.
 
 Availability checks currently work like this:
 
@@ -97,6 +99,18 @@ Run the MCP-enabled loop:
 ./pair_loop_mcp.sh "Build a Python CLI that parses Markdown front matter and outputs JSON" 3
 ```
 
+Run in non-destructive mode:
+
+```bash
+./pair_loop.sh --non-destructive --task "Improve an existing CLI tool"
+```
+
+Resume an existing MCP run:
+
+```bash
+./pair_loop_mcp.sh --resume --workspace ./workspace --log-dir ./logs
+```
+
 Arguments:
 
 - First argument: task description passed to both agents.
@@ -106,17 +120,32 @@ If you omit the task, each script falls back to its built-in default Python CLI 
 
 If you omit `max_iterations`, both scripts default to `999999`, which is effectively "run until stopped".
 
+Supported flags:
+
+- `--workspace PATH`: use a custom workspace directory
+- `--log-dir PATH`: use a custom log directory
+- `--task TEXT`: pass the task as a flag instead of a positional argument
+- `--max-iterations N`: pass the iteration count as a flag
+- `--resume`: continue from the current workspace and existing logs without cleaning them
+- `--keep-logs`: preserve existing log files on startup
+- `--keep-workspace`: preserve the existing workspace on startup
+- `--non-destructive`: preserve both workspace and logs
+
+`--resume` implies preserving both workspace and logs.
+
 ## Runtime output
 
 The scripts generate temporary output in two directories:
 
 - `workspace/`: the current generated project state, including `workspace/.loop_state.md`
 - `logs/`: per-iteration transcripts such as `claude_iterN.log`, `codex_iterN.log`, `claude_mcp_iterN.log`, and `codex_mcp_iterN.log`
+- handoff files in `logs/`: diff-aware summaries such as `claude_handoff_iterN.md`, `codex_handoff_iterN.md`, `claude_mcp_handoff_iterN.md`, and `codex_mcp_handoff_iterN.md`
 
 The terminal output also prints:
 
 - the active task
 - the workspace path
+- the log directory path
 - the current iteration number
 - the log file paths for each completed iteration
 
@@ -125,9 +154,9 @@ The terminal output also prints:
 `pair_loop.sh` is the more straightforward version.
 
 - Claude always goes first.
-- On iteration 1, Claude starts from the task plus an empty workspace.
-- On later iterations, Claude receives the tail of the previous Codex log.
-- Codex then receives the tail of the current Claude log.
+- By default it starts from a fresh workspace, but `--resume` and `--non-destructive` preserve existing state.
+- Claude receives the previous Codex handoff summary instead of a raw log tail.
+- Codex then receives the current Claude handoff summary.
 - Both agents are instructed to improve the same codebase incrementally and update `.loop_state.md`.
 
 This mode is easier to reason about because all collaboration is explicit in the alternating turns.
@@ -152,15 +181,17 @@ Use this mode when you want to experiment with richer collaboration patterns, no
 
 These scripts are intentionally aggressive about cleaning state.
 
-- They delete the contents of `workspace/` at the start of every run.
-- They delete the contents of `logs/` at the start of every run.
+- By default they clean the contents of `workspace/` at startup.
+- By default they clean the contents of `logs/` at startup.
 - The checked-in contents currently visible in those folders are only sample output from a prior MCP experiment.
-- Anything stored there should be considered disposable unless you copy it elsewhere first.
+- Use `--keep-workspace`, `--keep-logs`, `--non-destructive`, or `--resume` if you want to preserve existing state.
+- Anything stored there should be considered disposable unless you explicitly preserve it.
 
 Other practical caveats:
 
 - The scripts use `set -euo pipefail`, so an unhandled command failure stops the loop.
-- The shared context is based on log tails, not diffs or structured state.
+- Claude availability checks consume a lightweight `claude -p` request because there is no equivalent local status command for account/usage.
+- The shared context is now diff-aware, but still summary-based rather than a full semantic review.
 - There is no branch management, commit choreography, or checkpointing beyond the files left in `workspace/`.
 - MCP mode assumes the installed CLI behavior matches what the script expects.
 
@@ -180,7 +211,7 @@ Common issues:
   Check [`.mcp.json`](./.mcp.json), run `codex mcp list`, and confirm `npx` can launch the required packages.
 
 - nothing useful remains in `workspace/`
-  That may be expected if the run failed early or if you started a new run, because startup cleanup is destructive.
+  That may be expected if the run failed early or if you started a new run without a preserve flag.
 
 - loop keeps running
   Press `Ctrl-C` to stop it.
@@ -203,8 +234,8 @@ Use `pair_loop_mcp.sh` if you want:
 
 If you plan to keep evolving these tools, the highest-value follow-ups are:
 
-1. Add a non-destructive mode that preserves `workspace/` and `logs/`.
-2. Replace log-tail handoff with a diff-aware summary.
-3. Add argument parsing for flags such as `--workspace`, `--resume`, and `--keep-logs`.
-4. Add a `.gitignore` for generated logs and disposable workspace output.
-5. Add health checks up front for `claude`, `codex`, `node`, and MCP availability.
+1. Add automated tests for the shell flag parsing and resume behavior.
+2. Make the diff-aware handoff smarter by grouping changes by feature or file type.
+3. Add a dedicated `--session-name` or run-id flag so preserved logs can be grouped more cleanly.
+4. Add stricter validation for custom workspace/log directory combinations.
+5. Pin MCP package versions instead of relying on `@latest`.
