@@ -1,2 +1,3 @@
 logs/
 workspace/
+.local-ci.env

@@ -189,6 +189,7 @@ Supported flags:
 - `--role-preset balanced|docs-refactor|reviewer-builder`: bias each agent toward a different role
 - `--session-name NAME`: group logs and session state artifacts under `logs/NAME/`
 - `--validation-command CMD`: run a validation command after each iteration
+- `--turn-timeout SECONDS`: fail a Claude/Codex turn if it exceeds the timeout; `0` disables the limit
 - `--state-max-ledger-entries N`: keep only the most recent N detailed iterations in `.loop_state.md`
 - `--until-tests-pass`: stop when validation succeeds
 - `--until-checklist-complete`: stop when all Success Criteria checkboxes are checked
@@ -202,6 +203,7 @@ Supported flags:
 - `--keep-logs`: preserve existing log files on startup
 - `--keep-workspace`: preserve the existing workspace on startup
 - `--non-destructive`: preserve both workspace and logs
+- `--healthcheck-only`: run startup checks and exit before preparing a workspace or logs
 
 `--resume` implies preserving both workspace and logs.
 
@@ -215,10 +217,11 @@ Notes on model and effort settings:
 Notes on state, sessions, and stop conditions:
 
 - The live state mirrors are always `workspace/.loop_state.md` and `workspace/.loop_state.json`.
-- When `--session-name` is set, logs, handoffs, validation logs, and session copies of the state files are grouped under `logs/<session>/`.
+- When `--session-name` is set, logs, handoffs, validation logs, `run_summary.json`, and session copies of the state files are grouped under `logs/<session>/`.
 - `--until-tests-pass` uses `--validation-command` when provided, or attempts a best-effort auto-detection of common test commands.
 - `--until-checklist-complete` reads unchecked boxes from the `Success Criteria` section of `.loop_state.md`.
 - `--until-clean-git` checks the workspace repo while ignoring the generated `.loop_state` files.
+- `run_summary.json` is runner-owned state that captures startup health checks, final stop reason, validation status, and final per-agent statuses without relying on agent-edited files.
 
 ## Runtime output
 
@@ -228,6 +231,7 @@ The scripts generate temporary output in two directories:
 - `logs/`: per-iteration transcripts such as `claude_iterN.log`, `codex_iterN.log`, `claude_mcp_iterN.log`, and `codex_mcp_iterN.log`
 - handoff files in `logs/`: diff-aware summaries such as `claude_handoff_iterN.md`, `codex_handoff_iterN.md`, `claude_mcp_handoff_iterN.md`, and `codex_mcp_handoff_iterN.md`
 - validation logs in `logs/`: files such as `validation_iterN.log`
+- `run_summary.json` in the active log directory: final runner-owned summary for the session
 - session state mirrors in `logs/<session>/state/` when `--session-name` is used
 
 The terminal output also prints:
@@ -249,8 +253,9 @@ What it does:
 - runs `pair_loop.sh` by default, or `pair_loop_mcp.sh` with `--mode mcp`
 - uses a throwaway workspace and log directory under `/tmp`
 - asks the loop to create `smoke.txt` with exact content
-- verifies `workspace/.loop_state.md`, `workspace/.loop_state.json`, validation logs, and session-state mirrors
-- checks that validation finished with `passed`
+- verifies `workspace/.loop_state.md`, `workspace/.loop_state.json`, final-iteration validation logs, session-state mirrors, and `run_summary.json`
+- checks the runner-owned summary to confirm validation finished with `passed`
+- removes generated artifacts only when `--cleanup` is requested and the E2E run succeeds
 
 Important limitations:
 
@@ -267,6 +272,36 @@ Useful options:
 - `--require-codex-turn`
 - `--cleanup`
 - `--` to pass extra loop flags through to the underlying pair-loop script
+
+## Local CI and hooks
+
+If you want local-only checks on every commit, this repo now includes:
+
+- [`scripts/local-ci.sh`](./scripts/local-ci.sh): local runner for deterministic checks, live E2E, and hook installation
+- [`.githooks/pre-commit`](./.githooks/pre-commit): fast deterministic checks before each commit
+- [`.githooks/post-commit`](./.githooks/post-commit): starts the live authenticated Claude/Codex E2E in the background after each commit
+
+Enable the hooks for this clone:
+
+```bash
+chmod +x scripts/local-ci.sh .githooks/pre-commit .githooks/post-commit
+bash scripts/local-ci.sh install-hooks
+```
+
+Useful local commands:
+
+```bash
+bash scripts/local-ci.sh deterministic
+bash scripts/local-ci.sh live
+bash scripts/local-ci.sh all
+```
+
+Notes:
+
+- The post-commit hook is intentionally non-blocking. It starts the live E2E in the background and writes output under `logs/local-ci/`.
+- Only one background live E2E is started at a time; later commits skip launching a second one while the first is still running.
+- [`tests/e2e_live_pair_loop.sh`](./tests/e2e_live_pair_loop.sh) still uses your local authenticated `claude` and `codex` CLIs, so the post-commit hook consumes real usage.
+- You can copy [`.local-ci.env.example`](./.local-ci.env.example) to `.local-ci.env` to override local defaults such as mode, iteration count, or whether post-commit live runs are enabled.
 
 ## `pair_loop.sh` details
 
