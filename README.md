@@ -25,11 +25,19 @@ At startup, both scripts do the same base setup:
 
 During each iteration:
 
-1. Claude takes a turn and writes a transcript to `logs/`.
-2. Codex takes a turn and writes a transcript to `logs/`.
-3. The loop pauses briefly, then continues until it reaches `max_iterations` or you stop it with `Ctrl-C`.
+1. The scripts perform a lightweight availability check for both agents.
+2. Claude takes a turn and writes a transcript to `logs/`, or the turn is skipped if Claude is unavailable.
+3. Codex takes a turn and writes a transcript to `logs/`, or the turn is skipped if Codex is unavailable.
+4. The loop pauses briefly, then continues until it reaches `max_iterations` or you stop it with `Ctrl-C`.
 
 The scripts pass a lightweight summary between agents by taking the last 80 lines of the previous agent log. This is simple and transparent, but it is not a robust state-sharing mechanism. Important context can be lost if the log is noisy.
+
+Availability checks currently work like this:
+
+- Claude: a lightweight `claude -p` ping, which acts as an account/usage check
+- Codex: `codex login status`
+
+If a check fails, the script writes a skip note into that iteration's log file and continues with the next available agent instead of exiting immediately.
 
 ## Requirements
 
