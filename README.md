@@ -54,6 +54,21 @@ codex mcp add claude-code -- npx -y @steipete/claude-code-mcp@latest
 
 If the required MCP packages are not cached locally, `npx` may need network access the first time it runs.
 
+## Current MCP components
+
+As currently configured in this repo, [`pair_loop_mcp.sh`](./pair_loop_mcp.sh) depends on two external MCP projects:
+
+| Direction | Local config | Upstream project |
+| --- | --- | --- |
+| Claude -> Codex | [`.mcp.json`](./.mcp.json) starts `npx -y codex-mcp-server` under the MCP server name `codex-cli` | [`codex-mcp-server`](https://github.com/tuannvm/codex-mcp-server) |
+| Codex -> Claude | [`pair_loop_mcp.sh`](./pair_loop_mcp.sh) runs `codex mcp add claude-code -- npx -y @steipete/claude-code-mcp@latest` when the server is not already registered | [`@steipete/claude-code-mcp`](https://github.com/steipete/claude-code-mcp) |
+
+Notes:
+
+- These MCP dependencies are referenced from upstream packages and are not vendored into this repository.
+- The current script uses `@latest` for `@steipete/claude-code-mcp`, so future runs may pick up newer upstream behavior.
+- The current [`.mcp.json`](./.mcp.json) also does not pin a specific `codex-mcp-server` version.
+
 ## Quick start
 
 If the scripts are not executable in your clone:
