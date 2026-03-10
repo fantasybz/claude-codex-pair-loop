@@ -159,6 +159,12 @@ Run through the generated skill wrappers:
 ./skills/codex-first-pair-loop/scripts/run-pair-loop.sh --mcp --task "Continue the current project" --resume
 ```
 
+Run the live E2E smoke test:
+
+```bash
+./tests/e2e_live_pair_loop.sh --require-claude-turn --require-codex-turn
+```
+
 Arguments:
 
 - First argument: task description passed to both agents.
@@ -233,6 +239,34 @@ The terminal output also prints:
 - the active role preset and session name
 - the current iteration number
 - the log file paths for each completed iteration
+
+## Live E2E test
+
+The repo now includes a live smoke test at [`tests/e2e_live_pair_loop.sh`](./tests/e2e_live_pair_loop.sh).
+
+What it does:
+
+- runs `pair_loop.sh` by default, or `pair_loop_mcp.sh` with `--mode mcp`
+- uses a throwaway workspace and log directory under `/tmp`
+- asks the loop to create `smoke.txt` with exact content
+- verifies `workspace/.loop_state.md`, `workspace/.loop_state.json`, validation logs, and session-state mirrors
+- checks that validation finished with `passed`
+
+Important limitations:
+
+- this is a real integration test, not a mocked unit test
+- it consumes real Claude/Codex usage
+- it requires authenticated local CLIs and working network access
+- it is not suitable for sandboxed or offline CI by default
+
+Useful options:
+
+- `--mode standard|mcp`
+- `--first-agent claude|codex`
+- `--require-claude-turn`
+- `--require-codex-turn`
+- `--cleanup`
+- `--` to pass extra loop flags through to the underlying pair-loop script
 
 ## `pair_loop.sh` details
 
