@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/readme/banner.png" alt="claude-codex-pair-loop banner" width="100%" />
+</p>
+
 # Claude Code <-> Codex Pair Tools
 
 Local launcher scripts for running repeatable pair-programming loops between Claude Code and Codex.
@@ -5,6 +9,8 @@ Local launcher scripts for running repeatable pair-programming loops between Cla
 The tools share a workspace, maintain structured loop state, write per-turn logs and handoffs, and support validation-driven stop conditions. They are designed for local use with authenticated CLIs already installed.
 
 `workspace/` and `logs/` are generated runtime directories. They are disposable by default and ignored by Git.
+
+This repository is best suited to users who already run both CLIs locally and want a repeatable way to hand work back and forth between them.
 
 ## Features
 
@@ -35,10 +41,20 @@ If you want the most predictable execution path, start with `pair_loop.sh`.
 These scripts are intended for a local machine, not a hosted CI environment.
 
 - Bash
+- Git
 - Node.js v20+
 - `claude` CLI
 - `codex` CLI
 - `npx`
+
+## Compatibility
+
+- The entrypoints are Bash scripts and assume a POSIX-style local shell environment.
+- The documented workflow is aimed at macOS or Linux machines with local CLI authentication already available.
+- Hosted CI, sandboxed runners, and Windows-native shells are not the primary target environments.
+- Runtime behavior depends on the installed `claude` and `codex` CLI versions and the flags they currently support.
+
+## Installation and Authentication
 
 Expected local setup:
 
@@ -54,6 +70,30 @@ codex mcp add claude-code -- npx -y @steipete/claude-code-mcp@latest
 ```
 
 If the MCP packages are not already cached, `npx` may need network access on the first run.
+
+Recommended preflight checks:
+
+```bash
+bash --version
+git --version
+node --version
+claude -p "Reply with: ok"
+codex login status
+```
+
+Notes:
+
+- The Claude check above consumes a lightweight request.
+- Run these commands from the same shell profile you plan to use for the pair loop.
+
+## Trust Model
+
+These tools run autonomous coding agents against your local filesystem.
+
+- The runners allow Claude and Codex to edit files in `workspace/`, run shell commands, and optionally create checkpoint commits and tags.
+- Standard mode relies on `claude -p --dangerously-skip-permissions` and `codex exec --full-auto`.
+- MCP mode adds external MCP servers and may fetch packages on first use through `npx`.
+- Start in a disposable repository or throwaway task until you are comfortable with the runtime behavior and generated artifacts.
 
 ## Quick Start
 
@@ -136,6 +176,14 @@ Run startup checks only:
 ```bash
 ./pair_loop.sh --healthcheck-only
 ```
+
+What to expect after a run:
+
+- Generated project files appear under `workspace/`.
+- Session artifacts appear under `logs/` or `logs/<session>/` when you use `--session-name`.
+- The fastest summary is `run_summary.json`.
+- Human-readable state is recorded in `logs/.../state/loop_state.md`.
+- Machine-readable state is recorded in `logs/.../state/loop_state.json`.
 
 ## Command Reference
 
@@ -411,6 +459,26 @@ Typical fixes:
 - Re-run with `--keep-workspace`, `--keep-logs`, `--non-destructive`, or `--resume` if you need to preserve debugging artifacts.
 - Use `Ctrl-C` to stop a long-running loop manually.
 
+## Security
+
+For security-sensitive issues, do not open a public bug report. See [SECURITY.md](./SECURITY.md).
+
+## Contributing
+
+Contribution guidance now lives in [CONTRIBUTING.md](./CONTRIBUTING.md).
+
+- Run `bash scripts/local-ci.sh deterministic` before opening a PR.
+- Keep changes focused and update docs when runner behavior changes.
+- Add deterministic regression coverage for new flags, state fields, or lifecycle behavior.
+
+## Code of Conduct
+
+Community expectations now live in [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md).
+
+## License
+
+This project is licensed under the [MIT License](./LICENSE).
+
 ## Choosing a Mode
 
 Use `pair_loop.sh` when you want:
@@ -426,7 +494,7 @@ Use `pair_loop_mcp.sh` when you want:
 - Codex to call Claude during Codex's turn
 - to experiment with more autonomous cross-agent workflows
 
-## Suggested Improvements
+## Roadmap Ideas
 
 If you plan to keep evolving these tools, the highest-value follow-ups are:
 
