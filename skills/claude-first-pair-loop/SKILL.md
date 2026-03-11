@@ -20,9 +20,12 @@ Launch the repository pair-loop scripts with the turn order fixed to Claude-firs
    - Use `--non-destructive` when the user wants to keep current `workspace/` and `logs/`.
    - Only start destructive fresh runs when the user clearly wants a clean reset.
    - Use `--profile`, `--claude-model`, `--codex-model`, `--claude-effort`, and `--codex-effort` when the user wants explicit model or reasoning control.
-   - Use `--role-preset`, `--session-name`, `--validation-command`, stop-condition flags, and checkpoint flags when the user wants tighter run orchestration.
+   - Use `--role-preset`, `--session-name`, stop-condition flags, and checkpoint flags when the user wants tighter run orchestration.
+   - Prefer `--validation-preset pytest` for Python projects generated in the workspace.
+   - Use `--validation-command` only when the user explicitly wants full manual control over validation.
+   - Use `--turn-timeout` when the user wants a hard bound on long turns.
 4. Launch the wrapper script in `scripts/run-pair-loop.sh`.
-5. Inspect the generated logs and handoff files after the run if the user asks for results or debugging.
+5. Inspect the generated logs, handoff files, `run_summary.json`, and `logs/.../state/loop_state.{md,json}` after the run if the user asks for results or debugging.
 
 ## Commands
 
@@ -52,8 +55,14 @@ Explicit model and effort control:
 ./skills/claude-first-pair-loop/scripts/run-pair-loop.sh --profile deep --claude-model sonnet --codex-model gpt-5.3-codex --codex-effort xhigh --session-name hardening-pass --task "Continue the current project"
 ```
 
+Python run with safer validation defaults:
+
+```bash
+./skills/claude-first-pair-loop/scripts/run-pair-loop.sh --session-name hardening-pass --validation-preset pytest --until-tests-pass --task "Continue the current project"
+```
+
 ## Notes
 
 - The wrapper script automatically adds `--claude-first`.
 - Use the companion `codex-first-pair-loop` skill when the user wants Codex to lead instead.
-- The underlying repository scripts handle `--workspace`, `--log-dir`, `--profile`, `--claude-model`, `--codex-model`, `--claude-effort`, `--codex-effort`, `--role-preset`, `--session-name`, `--validation-command`, `--until-tests-pass`, `--until-checklist-complete`, `--until-clean-git`, `--checkpoint-commits`, `--checkpoint-tags`, `--resume`, `--keep-logs`, `--keep-workspace`, and `--non-destructive`.
+- The underlying repository scripts handle `--workspace`, `--log-dir`, `--profile`, `--claude-model`, `--codex-model`, `--claude-effort`, `--codex-effort`, `--role-preset`, `--session-name`, `--validation-command`, `--validation-preset`, `--validation-auto`, `--until-tests-pass`, `--until-checklist-complete`, `--until-clean-git`, `--checkpoint-commits`, `--checkpoint-tags`, `--turn-timeout`, `--resume`, `--keep-logs`, `--keep-workspace`, `--non-destructive`, and `--healthcheck-only`.
