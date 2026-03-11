@@ -86,6 +86,12 @@ perform_fake_turn() {
     checkpoint)
       printf '%s iteration %s\n' "$agent" "$iteration" > "$workdir/checkpoint-${agent}-${iteration}.txt"
       ;;
+    python-pytest-layout)
+      printf '[pytest]\naddopts = -q\n' > "$workdir/pytest.ini"
+      printf 'import pytest\n\n@pytest.fixture\ndef sample_user():\n    return {\"name\": \"test-user\"}\n' > "$workdir/conftest.py"
+      printf 'def test_health(sample_user):\n    assert sample_user[\"name\"] == \"test-user\"\n' > "$workdir/test_api.py"
+      printf '%s iteration %s\n' "$agent" "$iteration" > "$workdir/${agent}-iter-${iteration}.txt"
+      ;;
     timeout-codex)
       if [ "$agent" = "codex" ]; then
         sleep "${PAIR_LOOP_FAKE_SLEEP_SECONDS:-3}"
@@ -194,4 +200,12 @@ set -euo pipefail
 exit 0
 EOF
   chmod +x "$fake_bin/npx"
+
+  cat > "$fake_bin/pytest" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "fake pytest ok"
+exit 0
+EOF
+  chmod +x "$fake_bin/pytest"
 }

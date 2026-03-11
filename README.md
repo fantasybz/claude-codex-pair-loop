@@ -98,7 +98,7 @@ Run with session grouping, validation, stop conditions, and checkpoints:
 ./pair_loop.sh \
   --session-name hardening-pass \
   --role-preset docs-refactor \
-  --validation-command "pytest -q" \
+  --validation-preset pytest \
   --until-tests-pass \
   --until-checklist-complete \
   --checkpoint-commits \
@@ -161,6 +161,8 @@ Model, effort, and role configuration:
 Validation, stop conditions, and checkpoints:
 
 - `--validation-command CMD`
+- `--validation-preset auto|pytest|unittest|custom`
+- `--validation-auto`
 - `--until-tests-pass`
 - `--until-checklist-complete`
 - `--until-clean-git`
@@ -179,6 +181,11 @@ Behavior notes:
 - `--resume` implies preserving both workspace and logs.
 - Profile presets only affect effort defaults. They do not force a specific model.
 - Explicit `--claude-effort` or `--codex-effort` overrides the profile default for that agent.
+- `--validation-command` is for full manual control. Use it when you know the exact command you want.
+- `--validation-preset pytest` is the safest default for Python work generated in the workspace.
+- `--validation-preset unittest` assumes an importable `tests/` package and is stricter about project layout.
+- `--validation-auto` and the default auto mode detect common layouts such as `pytest.ini`, `conftest.py`, top-level `test_*.py`, `package.json`, `Cargo.toml`, and `go.mod`.
+- When a manual validation command looks inconsistent with the detected layout, the runner records a warning and a suggested command in the validation log, `loop_state.json`, and `run_summary.json`.
 - Claude effort is passed through as `claude --effort`.
 - Codex effort is passed through as `codex exec -c model_reasoning_effort="..."`.
 
@@ -199,7 +206,7 @@ During each iteration:
 2. The first agent takes a turn or is skipped if unavailable.
 3. The runner writes a per-turn log and a diff-aware handoff summary.
 4. The second agent takes a turn or is skipped if unavailable.
-5. The runner runs validation if configured or auto-detectable.
+5. The runner resolves validation from `--validation-command`, `--validation-preset`, or auto-detection, then runs it and records any preflight mismatch warning.
 6. Stop conditions are evaluated and the state files are regenerated.
 7. The loop either continues, stops because conditions were met, or exits when interrupted or capped by `max_iterations`.
 
@@ -228,6 +235,7 @@ State behavior:
 - Handoff files are diff-aware. They include a change summary, current Git status, workspace snapshot, and a runner-owned state snapshot.
 - Turn logs record both configured and resolved runtime model and effort when the underlying CLI exposes those values.
 - `loop_state.json` and `run_summary.json` split stop-condition data into `configured`, `current`, and `summary` so tooling can distinguish enabled checks from checks that are currently met.
+- Validation logs include the selected preset, selection mode, detected project layout, warning, and suggested command when the runner can infer one.
 - The workspace is reserved for generated project files. Runner state and handoff artifacts are kept under `logs/`.
 
 Session behavior:

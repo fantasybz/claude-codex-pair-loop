@@ -18,6 +18,9 @@
 #   --session-name NAME     Group logs and state artifacts under a session-specific log directory
 #   --validation-command CMD
 #                          Validation command to run after each iteration
+#   --validation-preset NAME
+#                          Validation preset: auto, pytest, unittest, or custom
+#   --validation-auto       Force validation auto-detection even when resuming
 #   --turn-timeout SECONDS  Kill a Claude/Codex turn after this many seconds (default: 0 = disabled)
 #   --state-max-ledger-entries N
 #                          Number of recent iterations to keep expanded in .loop_state.md
@@ -65,7 +68,17 @@ MODE="standard"
 ROLE_PRESET="balanced"
 SESSION_NAME=""
 VALIDATION_COMMAND=""
+VALIDATION_PRESET=""
 VALIDATION_COMMAND_USED=""
+VALIDATION_COMMAND_RESOLVED=""
+VALIDATION_PRESET_EFFECTIVE="auto"
+VALIDATION_SELECTION_MODE="auto"
+VALIDATION_DETECTED_ECOSYSTEM=""
+VALIDATION_DETECTED_LAYOUT=""
+VALIDATION_DETECTED_REASON=""
+VALIDATION_DETECTED_COMMAND=""
+VALIDATION_PRECHECK_WARNING=""
+VALIDATION_PRECHECK_HINT=""
 TURN_TIMEOUT="0"
 STATE_MAX_LEDGER_ENTRIES="12"
 UNTIL_TESTS_PASS=0
@@ -144,7 +157,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 usage() {
-  sed -n '1,40p' "$0"
+  sed -n '1,44p' "$0"
 }
 
 die() {
@@ -211,6 +224,186 @@ sanitize_name() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-'
 }
 
+preferred_python_runner() {
+  if command -v python3 >/dev/null 2>&1; then
+    echo "python3"
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1; then
+    echo "python"
+    return 0
+  fi
+  return 1
+}
+
+preferred_pytest_command() {
+  local runner
+  if [ -x "$WORKSPACE/.venv/bin/pytest" ]; then
+    echo ".venv/bin/pytest -q"
+    return 0
+  fi
+  if command -v pytest >/dev/null 2>&1; then
+    echo "pytest -q"
+    return 0
+  fi
+  if runner="$(preferred_python_runner)"; then
+    echo "$runner -m pytest -q"
+    return 0
+  fi
+  return 1
+}
+
+preferred_unittest_command() {
+  local runner
+  if runner="$(preferred_python_runner)"; then
+    echo "$runner -m unittest discover -s tests"
+    return 0
+  fi
+  return 1
+}
+
+workspace_has_root_python_tests() {
+  find "$WORKSPACE" -maxdepth 1 -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit 2>/dev/null | grep -q .
+}
+
+workspace_has_pytest_markers() {
+  if [ -f "$WORKSPACE/pytest.ini" ] || [ -f "$WORKSPACE/conftest.py" ] || [ -d "$WORKSPACE/.pytest_cache" ]; then
+    return 0
+  fi
+  if [ -f "$WORKSPACE/pyproject.toml" ] && grep -Eq '^\[tool\.pytest(\.ini_options)?\]' "$WORKSPACE/pyproject.toml" 2>/dev/null; then
+    return 0
+  fi
+  if workspace_has_root_python_tests; then
+    return 0
+  fi
+  return 1
+}
+
+detect_validation_layout() {
+  local suggested=""
+
+  VALIDATION_DETECTED_ECOSYSTEM=""
+  VALIDATION_DETECTED_LAYOUT=""
+  VALIDATION_DETECTED_REASON=""
+  VALIDATION_DETECTED_COMMAND=""
+
+  if [ -f "$WORKSPACE/Makefile" ] && grep -q '^test:' "$WORKSPACE/Makefile" 2>/dev/null; then
+    VALIDATION_DETECTED_ECOSYSTEM="build"
+    VALIDATION_DETECTED_LAYOUT="make-test-target"
+    VALIDATION_DETECTED_REASON="found Makefile test target"
+    VALIDATION_DETECTED_COMMAND="make test"
+    return 0
+  fi
+
+  if [ -f "$WORKSPACE/package.json" ]; then
+    VALIDATION_DETECTED_ECOSYSTEM="node"
+    VALIDATION_DETECTED_LAYOUT="npm-test-script"
+    VALIDATION_DETECTED_REASON="found package.json"
+    if command -v npm >/dev/null 2>&1; then
+      VALIDATION_DETECTED_COMMAND="npm test"
+    fi
+    return 0
+  fi
+
+  if workspace_has_pytest_markers; then
+    VALIDATION_DETECTED_ECOSYSTEM="python"
+    if [ -d "$WORKSPACE/tests" ]; then
+      if [ -f "$WORKSPACE/tests/__init__.py" ]; then
+        VALIDATION_DETECTED_LAYOUT="python-pytest-tests-package"
+      else
+        VALIDATION_DETECTED_LAYOUT="python-pytest-tests-dir"
+      fi
+    else
+      VALIDATION_DETECTED_LAYOUT="python-pytest-root-files"
+    fi
+
+    if [ -f "$WORKSPACE/pytest.ini" ]; then
+      VALIDATION_DETECTED_REASON="found pytest.ini"
+    elif [ -f "$WORKSPACE/conftest.py" ]; then
+      VALIDATION_DETECTED_REASON="found conftest.py"
+    elif workspace_has_root_python_tests; then
+      VALIDATION_DETECTED_REASON="found top-level Python test files"
+    elif [ -d "$WORKSPACE/.pytest_cache" ]; then
+      VALIDATION_DETECTED_REASON="found .pytest_cache"
+    else
+      VALIDATION_DETECTED_REASON="detected pytest-compatible Python project"
+    fi
+
+    if suggested="$(preferred_pytest_command)"; then
+      VALIDATION_DETECTED_COMMAND="$suggested"
+    fi
+    return 0
+  fi
+
+  if [ -d "$WORKSPACE/tests" ]; then
+    VALIDATION_DETECTED_ECOSYSTEM="python"
+    if [ -f "$WORKSPACE/tests/__init__.py" ]; then
+      VALIDATION_DETECTED_LAYOUT="python-unittest-tests-package"
+      VALIDATION_DETECTED_REASON="found importable tests package"
+      if suggested="$(preferred_unittest_command)"; then
+        VALIDATION_DETECTED_COMMAND="$suggested"
+      fi
+    else
+      VALIDATION_DETECTED_LAYOUT="python-tests-dir"
+      VALIDATION_DETECTED_REASON="found tests/ directory"
+      if suggested="$(preferred_pytest_command)"; then
+        VALIDATION_DETECTED_COMMAND="$suggested"
+      fi
+    fi
+    return 0
+  fi
+
+  if [ -f "$WORKSPACE/Cargo.toml" ]; then
+    VALIDATION_DETECTED_ECOSYSTEM="rust"
+    VALIDATION_DETECTED_LAYOUT="cargo-project"
+    VALIDATION_DETECTED_REASON="found Cargo.toml"
+    if command -v cargo >/dev/null 2>&1; then
+      VALIDATION_DETECTED_COMMAND="cargo test"
+    fi
+    return 0
+  fi
+
+  if [ -f "$WORKSPACE/go.mod" ]; then
+    VALIDATION_DETECTED_ECOSYSTEM="go"
+    VALIDATION_DETECTED_LAYOUT="go-module"
+    VALIDATION_DETECTED_REASON="found go.mod"
+    if command -v go >/dev/null 2>&1; then
+      VALIDATION_DETECTED_COMMAND="go test ./..."
+    fi
+    return 0
+  fi
+
+  return 1
+}
+
+command_references_tests_dir() {
+  printf '%s\n' "$1" | grep -Eq '(^|[[:space:]])(-s|--start-directory)[[:space:]]+tests([[:space:]]|$)|tests/'
+}
+
+analyze_validation_command() {
+  local cmd="$1"
+
+  VALIDATION_PRECHECK_WARNING=""
+  VALIDATION_PRECHECK_HINT=""
+
+  if [ ! -d "$WORKSPACE/tests" ] && command_references_tests_dir "$cmd"; then
+    VALIDATION_PRECHECK_WARNING="Validation command references tests/, but the workspace has no tests/ directory."
+    if [ -n "$VALIDATION_DETECTED_COMMAND" ]; then
+      VALIDATION_PRECHECK_HINT="Detected ${VALIDATION_DETECTED_LAYOUT:-project layout} (${VALIDATION_DETECTED_REASON:-auto-detected}); try ${VALIDATION_DETECTED_COMMAND}."
+    fi
+    return 0
+  fi
+
+  if [ "$VALIDATION_DETECTED_ECOSYSTEM" = "python" ] &&
+    printf '%s\n' "$cmd" | grep -Eq '(^|[[:space:]])python(3)?[[:space:]]+-m[[:space:]]+unittest([[:space:]]|$)|(^|[[:space:]])unittest([[:space:]]|$)' &&
+    printf '%s\n' "$VALIDATION_DETECTED_LAYOUT" | grep -q '^python-pytest'; then
+    VALIDATION_PRECHECK_WARNING="Validation command uses unittest, but the workspace layout looks pytest-based."
+    if [ -n "$VALIDATION_DETECTED_COMMAND" ]; then
+      VALIDATION_PRECHECK_HINT="Detected ${VALIDATION_DETECTED_LAYOUT} (${VALIDATION_DETECTED_REASON}); try ${VALIDATION_DETECTED_COMMAND}."
+    fi
+  fi
+}
+
 apply_role_preset() {
   case "$ROLE_PRESET" in
     balanced)
@@ -229,6 +422,24 @@ apply_role_preset() {
       die "role preset must be one of: balanced, docs-refactor, reviewer-builder"
       ;;
   esac
+}
+
+validate_validation_settings() {
+  case "${VALIDATION_PRESET:-}" in
+    ""|auto|pytest|unittest|custom)
+      ;;
+    *)
+      die "validation preset must be one of: auto, pytest, unittest, custom"
+      ;;
+  esac
+
+  if [ -n "$VALIDATION_COMMAND" ] && [ -n "$VALIDATION_PRESET" ] && [ "$VALIDATION_PRESET" != "custom" ]; then
+    die "validation command cannot be combined with validation preset '$VALIDATION_PRESET'"
+  fi
+
+  if [ "$VALIDATION_PRESET" = "custom" ] && [ -z "$VALIDATION_COMMAND" ]; then
+    die "validation preset 'custom' requires --validation-command"
+  fi
 }
 
 append_unique_line() {
@@ -396,7 +607,17 @@ render_state_files() {
   UNTIL_TESTS_PASS="$UNTIL_TESTS_PASS" \
   UNTIL_CHECKLIST_COMPLETE="$UNTIL_CHECKLIST_COMPLETE" \
   UNTIL_CLEAN_GIT="$UNTIL_CLEAN_GIT" \
+  VALIDATION_COMMAND="$VALIDATION_COMMAND" \
+  VALIDATION_PRESET="$VALIDATION_PRESET" \
+  VALIDATION_PRESET_EFFECTIVE="$VALIDATION_PRESET_EFFECTIVE" \
+  VALIDATION_SELECTION_MODE="$VALIDATION_SELECTION_MODE" \
   VALIDATION_COMMAND_USED="$VALIDATION_COMMAND_USED" \
+  VALIDATION_DETECTED_ECOSYSTEM="$VALIDATION_DETECTED_ECOSYSTEM" \
+  VALIDATION_DETECTED_LAYOUT="$VALIDATION_DETECTED_LAYOUT" \
+  VALIDATION_DETECTED_REASON="$VALIDATION_DETECTED_REASON" \
+  VALIDATION_DETECTED_COMMAND="$VALIDATION_DETECTED_COMMAND" \
+  VALIDATION_PRECHECK_WARNING="$VALIDATION_PRECHECK_WARNING" \
+  VALIDATION_PRECHECK_HINT="$VALIDATION_PRECHECK_HINT" \
   STATE_MAX_LEDGER_ENTRIES="$STATE_MAX_LEDGER_ENTRIES" \
     node "$SCRIPT_DIR/pair_loop_state_renderer.js" \
       "$STATE_FILE" \
@@ -560,31 +781,95 @@ workspace_git_is_clean() {
 }
 
 detect_validation_command() {
+  local cmd=""
+
+  VALIDATION_SELECTION_MODE="auto"
+  VALIDATION_PRESET_EFFECTIVE="auto"
+  VALIDATION_PRECHECK_WARNING=""
+  VALIDATION_PRECHECK_HINT=""
+  VALIDATION_COMMAND_RESOLVED=""
+  detect_validation_layout || true
+
   if [ -n "$VALIDATION_COMMAND" ]; then
-    printf '%s\n' "$VALIDATION_COMMAND"
+    VALIDATION_SELECTION_MODE="command"
+    VALIDATION_PRESET_EFFECTIVE="custom"
+    analyze_validation_command "$VALIDATION_COMMAND"
+    VALIDATION_COMMAND_RESOLVED="$VALIDATION_COMMAND"
     return 0
   fi
 
+  case "${VALIDATION_PRESET:-}" in
+    ""|auto)
+      VALIDATION_SELECTION_MODE="auto"
+      VALIDATION_PRESET_EFFECTIVE="auto"
+      if [ -n "$VALIDATION_DETECTED_COMMAND" ]; then
+        analyze_validation_command "$VALIDATION_DETECTED_COMMAND"
+        VALIDATION_COMMAND_RESOLVED="$VALIDATION_DETECTED_COMMAND"
+        return 0
+      fi
+      ;;
+    pytest)
+      VALIDATION_SELECTION_MODE="preset"
+      VALIDATION_PRESET_EFFECTIVE="pytest"
+      if cmd="$(preferred_pytest_command)"; then
+        analyze_validation_command "$cmd"
+        VALIDATION_COMMAND_RESOLVED="$cmd"
+        return 0
+      fi
+      ;;
+    unittest)
+      VALIDATION_SELECTION_MODE="preset"
+      VALIDATION_PRESET_EFFECTIVE="unittest"
+      if cmd="$(preferred_unittest_command)"; then
+        analyze_validation_command "$cmd"
+        VALIDATION_COMMAND_RESOLVED="$cmd"
+        return 0
+      fi
+      ;;
+    custom)
+      VALIDATION_SELECTION_MODE="command"
+      VALIDATION_PRESET_EFFECTIVE="custom"
+      ;;
+    *)
+      die "validation preset must be one of: auto, pytest, unittest, custom"
+      ;;
+  esac
+
   if [ -f "$WORKSPACE/Makefile" ] && grep -q '^test:' "$WORKSPACE/Makefile" 2>/dev/null; then
-    echo "make test"
+    VALIDATION_SELECTION_MODE="auto"
+    VALIDATION_PRESET_EFFECTIVE="auto"
+    analyze_validation_command "make test"
+    VALIDATION_COMMAND_RESOLVED="make test"
     return 0
   fi
   if [ -f "$WORKSPACE/package.json" ] && command -v npm >/dev/null 2>&1; then
-    echo "npm test"
+    VALIDATION_SELECTION_MODE="auto"
+    VALIDATION_PRESET_EFFECTIVE="auto"
+    analyze_validation_command "npm test"
+    VALIDATION_COMMAND_RESOLVED="npm test"
     return 0
   fi
-  if [ -f "$WORKSPACE/pyproject.toml" ] || [ -f "$WORKSPACE/pytest.ini" ] || [ -d "$WORKSPACE/tests" ]; then
-    if command -v pytest >/dev/null 2>&1; then
-      echo "pytest -q"
+  if [ -f "$WORKSPACE/pyproject.toml" ] || [ -f "$WORKSPACE/pytest.ini" ] || [ -f "$WORKSPACE/conftest.py" ] || [ -d "$WORKSPACE/tests" ] || workspace_has_root_python_tests; then
+    if cmd="$(preferred_pytest_command)"; then
+      VALIDATION_SELECTION_MODE="auto"
+      VALIDATION_PRESET_EFFECTIVE="auto"
+      analyze_validation_command "$cmd"
+      VALIDATION_COMMAND_RESOLVED="$cmd"
       return 0
     fi
   fi
   if [ -f "$WORKSPACE/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
-    echo "cargo test"
+    VALIDATION_SELECTION_MODE="auto"
+    VALIDATION_PRESET_EFFECTIVE="auto"
+    analyze_validation_command "cargo test"
+    VALIDATION_COMMAND_RESOLVED="cargo test"
     return 0
   fi
   if [ -f "$WORKSPACE/go.mod" ] && command -v go >/dev/null 2>&1; then
-    echo "go test ./..."
+    VALIDATION_SELECTION_MODE="auto"
+    VALIDATION_PRESET_EFFECTIVE="auto"
+    analyze_validation_command "go test ./..."
+    VALIDATION_COMMAND_RESOLVED="go test ./..."
     return 0
   fi
 
@@ -595,7 +880,7 @@ run_iteration_validation() {
   local cmd status started_at ended_at duration
   VALIDATION_LOG="$ACTIVE_LOG_DIR/validation_iter${ITERATION}.log"
 
-  if ! cmd="$(detect_validation_command)"; then
+  if ! detect_validation_command; then
     CURRENT_VALIDATION_STATUS="unavailable"
     CURRENT_VALIDATION_REASON="No validation command configured or auto-detected."
     VALIDATION_COMMAND_USED=""
@@ -603,10 +888,18 @@ run_iteration_validation() {
     return 0
   fi
 
+  cmd="$VALIDATION_COMMAND_RESOLVED"
   VALIDATION_COMMAND_USED="$cmd"
   started_at="$(date '+%Y-%m-%d %H:%M:%S')"
   local start_seconds end_seconds
   start_seconds="$(date +%s)"
+
+  if [ -n "$VALIDATION_PRECHECK_WARNING" ]; then
+    echo -e "${YELLOW}Validation preflight:${NC} $VALIDATION_PRECHECK_WARNING"
+    if [ -n "$VALIDATION_PRECHECK_HINT" ]; then
+      echo -e "${YELLOW}Validation hint:${NC} $VALIDATION_PRECHECK_HINT"
+    fi
+  fi
 
   if (
     cd "$WORKSPACE" &&
@@ -625,6 +918,14 @@ run_iteration_validation() {
     echo "# Validation Metrics"
     echo "timestamp: $started_at"
     echo "command: $cmd"
+    echo "selection_mode: $VALIDATION_SELECTION_MODE"
+    echo "preset: $VALIDATION_PRESET_EFFECTIVE"
+    echo "detected_ecosystem: $(display_value "$VALIDATION_DETECTED_ECOSYSTEM" "unknown")"
+    echo "detected_layout: $(display_value "$VALIDATION_DETECTED_LAYOUT" "unknown")"
+    echo "detected_reason: $(display_value "$VALIDATION_DETECTED_REASON" "none")"
+    echo "detected_command: $(display_value "$VALIDATION_DETECTED_COMMAND" "none")"
+    echo "warning: $(display_value "$VALIDATION_PRECHECK_WARNING" "none")"
+    echo "hint: $(display_value "$VALIDATION_PRECHECK_HINT" "none")"
     echo "duration_seconds: $duration"
     echo "exit_status: $status"
     echo "token_cost_info: unavailable"
@@ -640,6 +941,9 @@ run_iteration_validation() {
   else
     CURRENT_VALIDATION_STATUS="failed"
     CURRENT_VALIDATION_REASON="$cmd exited with status $status"
+    if [ -n "$VALIDATION_PRECHECK_HINT" ]; then
+      CURRENT_VALIDATION_REASON="${CURRENT_VALIDATION_REASON}. Hint: $VALIDATION_PRECHECK_HINT"
+    fi
   fi
 }
 
@@ -776,7 +1080,18 @@ append_iteration_record() {
   "mode": "$MODE",
   "validation": {
     "status": "$CURRENT_VALIDATION_STATUS",
-    "reason": "$(json_escape_inline "$CURRENT_VALIDATION_REASON")"
+    "reason": "$(json_escape_inline "$CURRENT_VALIDATION_REASON")",
+    "command": "$(json_escape_inline "$VALIDATION_COMMAND_USED")",
+    "preset": "$VALIDATION_PRESET_EFFECTIVE",
+    "selectionMode": "$VALIDATION_SELECTION_MODE",
+    "detected": {
+      "ecosystem": $(json_string_or_null "$VALIDATION_DETECTED_ECOSYSTEM"),
+      "layout": $(json_string_or_null "$VALIDATION_DETECTED_LAYOUT"),
+      "reason": $(json_string_or_null "$VALIDATION_DETECTED_REASON"),
+      "suggestedCommand": $(json_string_or_null "$VALIDATION_DETECTED_COMMAND")
+    },
+    "warning": $(json_string_or_null "$VALIDATION_PRECHECK_WARNING"),
+    "hint": $(json_string_or_null "$VALIDATION_PRECHECK_HINT")
   },
   "checkpoint": {
     "status": "$LAST_CHECKPOINT_STATUS",
@@ -854,7 +1169,16 @@ write_run_summary() {
   TURN_TIMEOUT="$TURN_TIMEOUT" \
   ROLE_PRESET="$ROLE_PRESET" \
   VALIDATION_COMMAND="$VALIDATION_COMMAND" \
+  VALIDATION_PRESET="$VALIDATION_PRESET" \
+  VALIDATION_PRESET_EFFECTIVE="$VALIDATION_PRESET_EFFECTIVE" \
+  VALIDATION_SELECTION_MODE="$VALIDATION_SELECTION_MODE" \
   VALIDATION_COMMAND_USED="$VALIDATION_COMMAND_USED" \
+  VALIDATION_DETECTED_ECOSYSTEM="$VALIDATION_DETECTED_ECOSYSTEM" \
+  VALIDATION_DETECTED_LAYOUT="$VALIDATION_DETECTED_LAYOUT" \
+  VALIDATION_DETECTED_REASON="$VALIDATION_DETECTED_REASON" \
+  VALIDATION_DETECTED_COMMAND="$VALIDATION_DETECTED_COMMAND" \
+  VALIDATION_PRECHECK_WARNING="$VALIDATION_PRECHECK_WARNING" \
+  VALIDATION_PRECHECK_HINT="$VALIDATION_PRECHECK_HINT" \
   STATE_MAX_LEDGER_ENTRIES="$STATE_MAX_LEDGER_ENTRIES" \
   RESUME="$RESUME" \
   KEEP_WORKSPACE="$KEEP_WORKSPACE" \
@@ -929,6 +1253,12 @@ const codexConfiguredModel = env.CODEX_MODEL || "default";
 const codexConfiguredEffort = env.CODEX_EFFORT || "default";
 const codexResolvedModel = textOrNull(env.CODEX_RESOLVED_MODEL);
 const codexResolvedEffort = textOrNull(env.CODEX_RESOLVED_EFFORT);
+const validationDetected = {
+  ecosystem: textOrNull(env.VALIDATION_DETECTED_ECOSYSTEM),
+  layout: textOrNull(env.VALIDATION_DETECTED_LAYOUT),
+  reason: textOrNull(env.VALIDATION_DETECTED_REASON),
+  suggestedCommand: textOrNull(env.VALIDATION_DETECTED_COMMAND),
+};
 const lastIteration = iterationsCompleted > 0 ? {
   iteration: iterationsCompleted,
   agents: [
@@ -966,6 +1296,11 @@ const lastIteration = iterationsCompleted > 0 ? {
     reason: env.CURRENT_VALIDATION_REASON,
     command: env.VALIDATION_COMMAND_USED || "",
     log: env.VALIDATION_LOG || "",
+    preset: env.VALIDATION_PRESET_EFFECTIVE || "auto",
+    selectionMode: env.VALIDATION_SELECTION_MODE || "auto",
+    detected: validationDetected,
+    warning: textOrNull(env.VALIDATION_PRECHECK_WARNING),
+    hint: textOrNull(env.VALIDATION_PRECHECK_HINT),
   },
   checkpoint: {
     status: env.LAST_CHECKPOINT_STATUS,
@@ -1000,6 +1335,8 @@ const summary = {
     turnTimeoutSeconds: num(env.TURN_TIMEOUT),
     rolePreset: env.ROLE_PRESET,
     validationCommand: env.VALIDATION_COMMAND || "",
+    validationPreset: env.VALIDATION_PRESET_EFFECTIVE || "auto",
+    validationSelectionMode: env.VALIDATION_SELECTION_MODE || "auto",
     validationCommandUsed: env.VALIDATION_COMMAND_USED || "",
     stateMaxLedgerEntries: num(env.STATE_MAX_LEDGER_ENTRIES),
     resume: bool(env.RESUME),
@@ -1019,6 +1356,11 @@ const summary = {
     reason: env.CURRENT_VALIDATION_REASON,
     command: env.VALIDATION_COMMAND_USED || "",
     log: env.VALIDATION_LOG || "",
+    preset: env.VALIDATION_PRESET_EFFECTIVE || "auto",
+    selectionMode: env.VALIDATION_SELECTION_MODE || "auto",
+    detected: validationDetected,
+    warning: textOrNull(env.VALIDATION_PRECHECK_WARNING),
+    hint: textOrNull(env.VALIDATION_PRECHECK_HINT),
   },
   checkpoint: {
     status: env.LAST_CHECKPOINT_STATUS,
@@ -2033,6 +2375,15 @@ parse_args() {
         VALIDATION_COMMAND="$2"
         shift 2
         ;;
+      --validation-preset)
+        [ "$#" -ge 2 ] || die "--validation-preset requires a value"
+        VALIDATION_PRESET="$2"
+        shift 2
+        ;;
+      --validation-auto)
+        VALIDATION_PRESET="auto"
+        shift
+        ;;
       --turn-timeout)
         [ "$#" -ge 2 ] || die "--turn-timeout requires a value"
         TURN_TIMEOUT="$2"
@@ -2182,6 +2533,7 @@ parse_args() {
 
   apply_profile_defaults
   validate_effort_settings
+  validate_validation_settings
   apply_role_preset
 }
 
@@ -2218,6 +2570,7 @@ echo -e "${YELLOW}Codex model:${NC} $(display_value "$CODEX_MODEL" "default")"
 echo -e "${YELLOW}Codex effort:${NC} $(display_value "$CODEX_EFFORT" "default")"
 echo -e "${YELLOW}Role preset:${NC} $ROLE_PRESET"
 echo -e "${YELLOW}Session:${NC} $(display_value "$SESSION_NAME" "default")"
+echo -e "${YELLOW}Validation preset:${NC} $(display_value "$VALIDATION_PRESET" "auto")"
 echo -e "${YELLOW}Validation command:${NC} $(display_value "$VALIDATION_COMMAND" "auto")"
 if [ "$TURN_TIMEOUT" -gt 0 ]; then
   echo -e "${YELLOW}Turn timeout:${NC} ${TURN_TIMEOUT}s"

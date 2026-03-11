@@ -344,6 +344,119 @@ EOF
   rm -rf "$tmp_dir"
 }
 
+run_validation_preset_case() {
+  local tmp_dir fake_bin workspace log_dir session summary_file state_json
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/pairloop-validation-presetXXXXXX")"
+  fake_bin="$tmp_dir/bin"
+  workspace="$tmp_dir/workspace"
+  log_dir="$tmp_dir/logs"
+  session="validation-preset-case"
+  summary_file="$log_dir/$session/run_summary.json"
+  state_json="$log_dir/$session/state/loop_state.json"
+
+  make_fake_bin "$fake_bin"
+
+  (
+    cd "$ROOT_DIR"
+    PATH="$fake_bin:$PATH" PAIR_LOOP_FAKE_SCENARIO=python-pytest-layout ./pair_loop.sh \
+      --workspace "$workspace" \
+      --log-dir "$log_dir" \
+      --session-name "$session" \
+      --task "validation preset regression" \
+      --max-iterations 2 \
+      --validation-preset pytest \
+      --until-tests-pass \
+      > "$tmp_dir/output.txt" 2>&1
+  )
+
+  grep -q 'command: pytest -q' "$log_dir/$session/validation_iter1.log" || die "expected pytest validation command"
+  grep -q 'preset: pytest' "$log_dir/$session/validation_iter1.log" || die "expected pytest preset in validation log"
+  grep -q 'detected_layout: python-pytest-root-files' "$log_dir/$session/validation_iter1.log" || die "expected pytest layout detection in validation log"
+  assert_no_iteration_two "$log_dir/$session"
+
+  node - "$summary_file" "$state_json" <<'EOF'
+const fs = require("fs");
+const [summaryPath, statePath] = process.argv.slice(2);
+const summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+if (summary.validation.status !== "passed") {
+  throw new Error(`expected summary.validation.status=passed, got ${summary.validation.status}`);
+}
+if (summary.config.validationPreset !== "pytest") {
+  throw new Error(`expected config.validationPreset=pytest, got ${summary.config.validationPreset}`);
+}
+if (summary.config.validationSelectionMode !== "preset") {
+  throw new Error(`expected config.validationSelectionMode=preset, got ${summary.config.validationSelectionMode}`);
+}
+if (summary.validation.detected.layout !== "python-pytest-root-files") {
+  throw new Error(`unexpected validation layout: ${summary.validation.detected.layout}`);
+}
+if (state.validation.preset !== "pytest") {
+  throw new Error(`expected state.validation.preset=pytest, got ${state.validation.preset}`);
+}
+if (state.validation.detected.layout !== "python-pytest-root-files") {
+  throw new Error(`unexpected state validation layout: ${state.validation.detected.layout}`);
+}
+EOF
+
+  rm -rf "$tmp_dir"
+}
+
+run_validation_warning_case() {
+  local tmp_dir fake_bin workspace log_dir session summary_file state_json
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/pairloop-validation-warningXXXXXX")"
+  fake_bin="$tmp_dir/bin"
+  workspace="$tmp_dir/workspace"
+  log_dir="$tmp_dir/logs"
+  session="validation-warning-case"
+  summary_file="$log_dir/$session/run_summary.json"
+  state_json="$log_dir/$session/state/loop_state.json"
+
+  make_fake_bin "$fake_bin"
+
+  (
+    cd "$ROOT_DIR"
+    PATH="$fake_bin:$PATH" PAIR_LOOP_FAKE_SCENARIO=python-pytest-layout ./pair_loop.sh \
+      --workspace "$workspace" \
+      --log-dir "$log_dir" \
+      --session-name "$session" \
+      --task "validation warning regression" \
+      --max-iterations 1 \
+      --validation-command "python3 -m unittest discover -s tests" \
+      --until-tests-pass \
+      > "$tmp_dir/output.txt" 2>&1
+  )
+
+  grep -q 'warning: Validation command references tests/, but the workspace has no tests/ directory.' "$log_dir/$session/validation_iter1.log" || die "expected tests-dir warning in validation log"
+  grep -q 'hint: Detected python-pytest-root-files' "$log_dir/$session/validation_iter1.log" || die "expected pytest hint in validation log"
+
+  node - "$summary_file" "$state_json" <<'EOF'
+const fs = require("fs");
+const [summaryPath, statePath] = process.argv.slice(2);
+const summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+if (summary.validation.status !== "failed") {
+  throw new Error(`expected summary.validation.status=failed, got ${summary.validation.status}`);
+}
+if (!summary.validation.warning || !summary.validation.warning.includes("no tests/ directory")) {
+  throw new Error(`missing validation warning: ${summary.validation.warning}`);
+}
+if (!summary.validation.hint || !summary.validation.hint.includes("pytest -q")) {
+  throw new Error(`missing validation hint: ${summary.validation.hint}`);
+}
+if (summary.validation.detected.layout !== "python-pytest-root-files") {
+  throw new Error(`unexpected detected layout: ${summary.validation.detected.layout}`);
+}
+if (!state.validation.warning || !state.validation.hint) {
+  throw new Error("expected validation warning and hint in state json");
+}
+EOF
+
+  rm -rf "$tmp_dir"
+}
+
 run_mcp_summary_case() {
   local tmp_dir fake_bin workspace log_dir session summary_file
 
@@ -358,16 +471,18 @@ run_mcp_summary_case() {
 
   (
     cd "$ROOT_DIR"
-    PATH="$fake_bin:$PATH" PAIR_LOOP_FAKE_SCENARIO=smoke ./pair_loop_mcp.sh \
+    PATH="$fake_bin:$PATH" PAIR_LOOP_FAKE_SCENARIO=python-pytest-layout ./pair_loop_mcp.sh \
       --workspace "$workspace" \
       --log-dir "$log_dir" \
       --session-name "$session" \
       --task "mcp regression" \
-      --max-iterations 1 \
+      --max-iterations 2 \
       --claude-model claude-mcp-configured \
       --claude-effort low \
       --codex-model codex-mcp-configured \
       --codex-effort medium \
+      --validation-preset pytest \
+      --until-tests-pass \
       > "$tmp_dir/output.txt" 2>&1
   )
 
@@ -388,9 +503,18 @@ if (summary.session.mode !== "mcp") {
 if (!summary.healthChecks.mcp.available) {
   throw new Error("expected MCP health check to be available");
 }
+if (summary.validation.status !== "passed") {
+  throw new Error(`expected validation.status=passed, got ${summary.validation.status}`);
+}
+if (summary.config.validationPreset !== "pytest") {
+  throw new Error(`expected validation preset pytest, got ${summary.config.validationPreset}`);
+}
 const claude = summary.lastIteration.agents.find((agent) => agent.name === "Claude Code");
 if (!claude || claude.resolvedModel !== "claude-runtime-sonnet") {
   throw new Error("expected resolved Claude metadata in MCP summary");
+}
+if (summary.validation.detected.layout !== "python-pytest-root-files") {
+  throw new Error(`unexpected MCP validation layout: ${summary.validation.detected.layout}`);
 }
 EOF
 
@@ -405,6 +529,8 @@ run_clean_git_stop_case
 run_checkpoint_case
 run_timeout_case
 run_metadata_and_state_case
+run_validation_preset_case
+run_validation_warning_case
 run_mcp_summary_case
 
 echo "pair loop integration regression checks passed"
