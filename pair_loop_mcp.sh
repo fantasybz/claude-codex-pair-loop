@@ -181,6 +181,100 @@ display_value() {
   fi
 }
 
+progress_interval_seconds() {
+  local interval="${TURN_PROGRESS_INTERVAL:-15}"
+  case "$interval" in
+    ''|*[!0-9]*)
+      interval=15
+      ;;
+  esac
+  if [ "$interval" -le 0 ]; then
+    interval=15
+  fi
+  printf '%s\n' "$interval"
+}
+
+preview_text() {
+  local text="$1"
+  local limit="${2:-120}"
+  local compact
+
+  compact="$(printf '%s' "$text" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+  if [ "${#compact}" -gt "$limit" ]; then
+    printf '%s...\n' "${compact:0:$limit}"
+  else
+    printf '%s\n' "$compact"
+  fi
+}
+
+print_turn_runtime_header() {
+  local color="$1"
+  local goal="$2"
+  local role_focus="$3"
+  local log_file="$4"
+
+  echo -e "${color}   Task:${NC} $(preview_text "$TASK" 100)"
+  echo -e "${color}   Goal:${NC} $(preview_text "$goal" 100)"
+  echo -e "${color}   Focus:${NC} $(preview_text "$role_focus" 100)"
+  echo -e "${color}   Log:${NC} $log_file"
+  if [ "$TURN_TIMEOUT" -gt 0 ]; then
+    echo -e "${color}   Timeout:${NC} ${TURN_TIMEOUT}s"
+  else
+    echo -e "${color}   Timeout:${NC} disabled"
+  fi
+}
+
+run_command_with_progress() {
+  local timeout_seconds="$1"
+  local progress_label="$2"
+  local progress_detail="$3"
+  local output_file="$4"
+  shift 4
+
+  local pid elapsed status interval next_tick
+  interval="$(progress_interval_seconds)"
+  next_tick="$interval"
+  : > "$output_file"
+
+  echo -e "${CYAN}   Status:${NC} ${progress_label} started"
+  echo -e "${CYAN}   Work:${NC} $(preview_text "$progress_detail" 110)"
+
+  (
+    "$@" >"$output_file" 2>&1
+  ) &
+  pid=$!
+  elapsed=0
+
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$timeout_seconds" -gt 0 ] && [ "$elapsed" -ge "$timeout_seconds" ]; then
+      kill "-$pid" 2>/dev/null || true
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "-$pid" 2>/dev/null || true
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      echo -e "${YELLOW}   Status:${NC} ${progress_label} timed out after ${timeout_seconds}s${NC}"
+      return 124
+    fi
+
+    sleep 1
+    elapsed=$((elapsed + 1))
+    if [ "$elapsed" -ge "$next_tick" ]; then
+      echo -e "${CYAN}   In progress:${NC} ${progress_label} still running (${elapsed}s elapsed)"
+      next_tick=$((next_tick + interval))
+    fi
+  done
+
+  if wait "$pid"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  echo -e "${CYAN}   Status:${NC} ${progress_label} finished in ${elapsed}s (exit ${status})"
+  return "$status"
+}
+
 apply_profile_defaults() {
   case "$PROFILE" in
     "")
@@ -1945,12 +2039,15 @@ EOF
 
 run_claude() {
   local prompt="$1"
+  local turn_goal="$2"
+  local role_focus="$3"
   local log_file="$ACTIVE_LOG_DIR/claude_mcp_iter${ITERATION}.log"
   local raw_log start_seconds end_seconds started_at status
   local cmd=()
 
   echo -e "${GREEN}🤖 [Claude Code + Codex MCP] Iteration $ITERATION${NC}"
   echo -e "${GREEN}   Prompt:${NC} ${prompt:0:120}..."
+  print_turn_runtime_header "$GREEN" "$turn_goal" "$role_focus" "$log_file"
   echo ""
 
   cmd=(
@@ -1974,24 +2071,18 @@ run_claude() {
   CLAUDE_RESOLVED_MODEL=""
   CLAUDE_RESOLVED_EFFORT=""
 
-  if [ "$TURN_TIMEOUT" -gt 0 ]; then
-    if (
-      cd "$WORKSPACE" &&
-      PAIR_LOOP_STATE_FILE="$STATE_FILE" run_with_timeout "$TURN_TIMEOUT" "${cmd[@]}"
-    ) > "$raw_log" 2>&1; then
-      status=0
-    else
-      status=$?
-    fi
+  if (
+    cd "$WORKSPACE" &&
+    PAIR_LOOP_STATE_FILE="$STATE_FILE" run_command_with_progress \
+      "$TURN_TIMEOUT" \
+      "Claude Code MCP iteration $ITERATION" \
+      "$turn_goal" \
+      "$raw_log" \
+      "${cmd[@]}"
+  ); then
+    status=0
   else
-    if (
-      cd "$WORKSPACE" &&
-      PAIR_LOOP_STATE_FILE="$STATE_FILE" "${cmd[@]}"
-    ) > "$raw_log" 2>&1; then
-      status=0
-    else
-      status=$?
-    fi
+    status=$?
   fi
 
   end_seconds="$(date +%s)"
@@ -2025,12 +2116,15 @@ run_claude() {
 
 run_codex() {
   local prompt="$1"
+  local turn_goal="$2"
+  local role_focus="$3"
   local log_file="$ACTIVE_LOG_DIR/codex_mcp_iter${ITERATION}.log"
   local raw_log start_seconds end_seconds started_at status
   local cmd=()
 
   echo -e "${BLUE}🧠 [Codex + Claude Code MCP] Iteration $ITERATION${NC}"
   echo -e "${BLUE}   Prompt:${NC} ${prompt:0:120}..."
+  print_turn_runtime_header "$BLUE" "$turn_goal" "$role_focus" "$log_file"
   echo ""
 
   cmd=(
@@ -2052,18 +2146,15 @@ run_codex() {
   CODEX_RESOLVED_MODEL=""
   CODEX_RESOLVED_EFFORT=""
 
-  if [ "$TURN_TIMEOUT" -gt 0 ]; then
-    if PAIR_LOOP_STATE_FILE="$STATE_FILE" run_with_timeout "$TURN_TIMEOUT" "${cmd[@]}" > "$raw_log" 2>&1; then
-      status=0
-    else
-      status=$?
-    fi
+  if PAIR_LOOP_STATE_FILE="$STATE_FILE" run_command_with_progress \
+    "$TURN_TIMEOUT" \
+    "Codex MCP iteration $ITERATION" \
+    "$turn_goal" \
+    "$raw_log" \
+    "${cmd[@]}"; then
+    status=0
   else
-    if PAIR_LOOP_STATE_FILE="$STATE_FILE" "${cmd[@]}" > "$raw_log" 2>&1; then
-      status=0
-    else
-      status=$?
-    fi
+    status=$?
   fi
 
   end_seconds="$(date +%s)"
@@ -2098,7 +2189,7 @@ run_codex() {
 execute_claude_turn() {
   local incoming_summary="$1"
   local is_first_turn="$2"
-  local files_snapshot tmp_root next_agent next_role
+  local files_snapshot tmp_root next_agent next_role turn_goal
 
   files_snapshot="$(workspace_snapshot)"
   tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/pairloopmcpclaudeXXXXXX")"
@@ -2107,6 +2198,7 @@ execute_claude_turn() {
 
   if [ "$CLAUDE_AVAILABLE" -eq 1 ]; then
     if [ "$is_first_turn" -eq 1 ]; then
+      turn_goal="Review the current workspace, implement the next slice, and delegate through Codex MCP if it helps."
       CLAUDE_PROMPT="You are in a pair-programming loop with OpenAI Codex. You go first.
 
 TASK: $TASK
@@ -2132,6 +2224,7 @@ $CLAUDE_FOLLOWUP_STEP
 
 Build incrementally. Do not rewrite everything."
     else
+      turn_goal="Review Codex's handoff, improve the code, and optionally delegate follow-up work through Codex MCP."
       CLAUDE_PROMPT="You are in a pair-programming loop with OpenAI Codex. This is iteration $ITERATION.
 
 TASK: $TASK
@@ -2162,7 +2255,7 @@ $CLAUDE_FOLLOWUP_STEP
 Build incrementally. Do not rewrite everything."
     fi
 
-    if run_claude "$CLAUDE_PROMPT"; then
+    if run_claude "$CLAUDE_PROMPT" "$turn_goal" "$CLAUDE_ROLE_FOCUS"; then
       CLAUDE_TURN_STATUS="completed"
       CLAUDE_TURN_REASON=""
     else
@@ -2221,7 +2314,7 @@ Build incrementally. Do not rewrite everything."
 execute_codex_turn() {
   local incoming_summary="$1"
   local is_first_turn="$2"
-  local files_snapshot tmp_root next_agent next_role
+  local files_snapshot tmp_root next_agent next_role turn_goal
 
   files_snapshot="$(workspace_snapshot)"
   tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/pairloopmcpcodexXXXXXX")"
@@ -2230,6 +2323,7 @@ execute_codex_turn() {
 
   if [ "$CODEX_AVAILABLE" -eq 1 ]; then
     if [ "$is_first_turn" -eq 1 ]; then
+      turn_goal="Review the current workspace, implement the next slice, and delegate through Claude Code MCP if it helps."
       CODEX_PROMPT="You are in a pair-programming loop with Claude Code. You go first.
 
 TASK: $TASK
@@ -2255,6 +2349,7 @@ $CODEX_FOLLOWUP_STEP
 
 Build incrementally. Do not rewrite everything."
     else
+      turn_goal="Review Claude's handoff, improve the code, and optionally delegate follow-up work through Claude Code MCP."
       CODEX_PROMPT="You are in a pair-programming loop with Claude Code. This is iteration $ITERATION.
 
 TASK: $TASK
@@ -2285,7 +2380,7 @@ $CODEX_FOLLOWUP_STEP
 Build incrementally. Do not rewrite everything."
     fi
 
-    if run_codex "$CODEX_PROMPT"; then
+    if run_codex "$CODEX_PROMPT" "$turn_goal" "$CODEX_ROLE_FOCUS"; then
       CODEX_TURN_STATUS="completed"
       CODEX_TURN_REASON=""
     else
