@@ -6,6 +6,19 @@ The tools share a workspace, maintain structured loop state, write per-turn logs
 
 `workspace/` and `logs/` are generated runtime directories. They are disposable by default and ignored by Git.
 
+## Features
+
+- Alternating Claude Code and Codex turns against the same shared workspace
+- Standard mode for predictable runs and MCP mode for cross-agent delegation inside each turn
+- Structured run artifacts including per-turn logs, handoffs, `run_summary.json`, and logs-based state files
+- Validation-aware stopping with `--validation-command`, `--validation-preset`, and project layout auto-detection
+- Stop conditions for passing validation, completing checklist items, and reaching a clean Git worktree
+- Optional checkpoint commits and tags after each iteration
+- Resume and non-destructive modes for continuing existing runs without clearing workspace or logs
+- Per-turn timeout control and startup health-check-only mode
+- Local deterministic regression checks plus optional live authenticated local E2E hooks
+- Lightweight wrapper skills for Claude-first and Codex-first execution flows
+
 ## Overview
 
 | Tool | Purpose | Recommended use |
